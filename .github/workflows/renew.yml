@@ -21,13 +21,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'  # 缓存 pip 下载，多次运行不用重新下载依赖
+          cache-dependency-path: 'requirements.txt'
 
       - name: 🛠️ 安装系统依赖和 Python 依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
           pip install --upgrade pip
-          pip install seleniumbase requests
+          pip install -r requirements.txt
           seleniumbase install chromedriver
 
       - name: 🔗 设置代理 (sing-box)
