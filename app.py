@@ -105,6 +105,7 @@ _START_TIME = None
 _ACCOUNT = ""
 _APP_UPTIME = ""
 _SERVER_STATUS = ""  # running / started / start_failed / unknown
+_EXIT_IP = ""  # 脱敏后的出口 IP（+代理/直连标注），用于 TG 通知
 _FAILED = False  # 任一关键步骤失败 → 退出码 1
 TZ_CN = ZoneInfo("Asia/Shanghai")
 
@@ -288,6 +289,8 @@ def format_notification(
     display_account = mask_email(account or _ACCOUNT or EMAIL)
     lines = ["🇫🇮 Bot-hosting 续期通知", "", status, f"👤 登录账户: {display_account}",
              f"🔐 登录方式: {_LOGIN_METHOD}"]
+    if _EXIT_IP:
+        lines.append(f"🌐 出口IP: {_EXIT_IP}")
     if expiry_date:
         lines.append(f"📅 到期时间: {expiry_date}")
     if extra:
@@ -1149,7 +1152,7 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server, seen_identi
            skipped: 是否因重复而跳过)。
     """
     global SESSION_TOKEN, DC_TOKEN, SERVER_URL
-    global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS, _LOGIN_METHOD, _FAILED
+    global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS, _LOGIN_METHOD, _FAILED, _EXIT_IP
     orig_session = acct["session_token"]
     SESSION_TOKEN = orig_session
     DC_TOKEN = acct["discord_token"]
@@ -1170,8 +1173,11 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server, seen_identi
 
     with SB(**sb_kwargs) as sb:
         try:
-            print(f"📍 当前出口 IP: {mask_ip(get_current_ip(proxy_server if is_proxy else ''))}")
+            raw_ip = get_current_ip(proxy_server if is_proxy else "")
+            _EXIT_IP = f"{mask_ip(raw_ip)}（{'代理' if is_proxy else '直连'}）"
+            print(f"📍 当前出口 IP: {_EXIT_IP}")
         except Exception as e:
+            _EXIT_IP = ""
             print(f"⚠️ 获取出口 IP 失败: {e}")
 
         login_ok = False
