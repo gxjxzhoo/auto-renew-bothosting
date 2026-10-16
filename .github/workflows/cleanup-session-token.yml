@@ -27,5 +27,5 @@ jobs:
           # 验证：第 2 行为空（只查长度，不打印值）
           if [ -n "$(sed -n '2p' /tmp/new_session.txt)" ]; then echo "验证失败"; exit 1; fi
           echo "验证通过：第 2 行为空，行数仍为 3"
-          gh secret set SESSION_TOKEN --repo "${{ github.repository }}" --body-file /tmp/new_session.txt
+          gh secret set SESSION_TOKEN --repo "${{ github.repository }}" < /tmp/new_session.txt
           echo "回写完成"
