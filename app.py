@@ -37,14 +37,43 @@ GH_TOKEN = os.environ.get("GH_TOKEN") or ""
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 
-# 解析 DISCORD_TOKEN（支持 "备注,token" 格式）
-DC_TOKEN = DISCORD_TOKEN.split(",", 1)[-1].strip() if DISCORD_TOKEN else ""
+# 多账号：一行一个，SESSION_TOKEN / DISCORD_TOKEN 分别按行写，按行号配对
+def parse_accounts():
+    """
+    解析多账号：SESSION_TOKEN / DISCORD_TOKEN 分别按行分隔，按行号配对；
+    DISCORD_TOKEN 的每一行仍支持 "备注,token" 写法（备注仅用于日志区分账号）。
+    返回 [{"session_token":..., "discord_token":..., "note":...}, ...]，
+    空行会被忽略。
+    """
+    sess = [t.strip() for t in SESSION_TOKEN.splitlines()] if SESSION_TOKEN else []
+    disc = [t.strip() for t in DISCORD_TOKEN.splitlines()] if DISCORD_TOKEN else []
+    sess = [t for t in sess if t]
+    disc = [t for t in disc if t]
+    if sess and disc and len(sess) != len(disc):
+        # 行数对不上极可能是漏贴了一行，大声告警（缺的按空补齐，不静默错配）
+        print(f"⚠️ SESSION_TOKEN 有 {len(sess)} 行，DISCORD_TOKEN 有 {len(disc)} 行，"
+              f"按行号配对，缺的用空补齐——请检查是否漏贴了一行！")
+    n = max(len(sess), len(disc))
+    sess += [""] * (n - len(sess))
+    disc += [""] * (n - len(disc))
+    accounts = []
+    for s, d in zip(sess, disc):
+        if "," in d:
+            note, tok = d.split(",", 1)
+        else:
+            note, tok = "", d
+        accounts.append({"session_token": s, "discord_token": tok.strip(),
+                         "note": note.strip()})
+    return [a for a in accounts if a["session_token"] or a["discord_token"]]
 
-if not SESSION_TOKEN and not DC_TOKEN:
+
+# 回写 SESSION_TOKEN 时多账号用换行拼接
+ACCOUNT_JOIN = "\n"
+
+
+if not SESSION_TOKEN and not DISCORD_TOKEN:
     print("ℹ️ 未配置 SESSION_TOKEN 和 DISCORD_TOKEN，脚本终止。")
     sys.exit(1)
-
-COOKIES = {"session_token": SESSION_TOKEN, "login": "true", "theme": "system"}
 
 BASE = "https://bot-hosting.net"
 BILLINGS_URL = f"{BASE}/a/billings"
@@ -1064,25 +1093,41 @@ def goto_billings(sb) -> bool:
     return "/a/billings" in url and "/login" not in url and "error=" not in url
 
 
-def run():
-    global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS, _LOGIN_METHOD, _FAILED
-    _START_TIME = time.time()
-    _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
-
-    print("#" * 28)
-    print("   Bot-hosting 自动续期 v3.9")
-    print("#" * 28)
-
+def build_sb_kwargs():
+    """代理/无头配置（多账号共用一份）"""
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
     proxy_server = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
     headless = os.environ.get("HEADLESS", "false").lower() == "true"
-
     sb_kwargs = {"uc": True, "headless": headless}
     if is_proxy:
         print(f"🔗 挂载代理: {re.sub(r'//[^/@]*@', '//***@', proxy_server)}")
         sb_kwargs["proxy"] = proxy_server
     else:
         print("🍭 未使用代理，直连访问")
+    return sb_kwargs, is_proxy, proxy_server
+
+
+def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server):
+    """
+    单个账号完整流程。每个账号用全新浏览器上下文（cookie 不串号）。
+    返回 (ok: 是否成功, new_session_token: 刷新后的 token 或 None)。
+    """
+    global SESSION_TOKEN, DC_TOKEN
+    global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS, _LOGIN_METHOD, _FAILED
+    SESSION_TOKEN = acct["session_token"]
+    DC_TOKEN = acct["discord_token"]
+    _LOGIN_METHOD = "SESSION_TOKEN"
+    _START_TIME = time.time()
+    _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
+    _FAILED = False
+
+    tag = f"账号 {idx + 1}/{total}" + (f"（{acct['note']}）" if acct["note"] else "")
+    print("\n" + "=" * 28)
+    print(f"   {tag}")
+    print("=" * 28)
+
+    cookies = {"session_token": SESSION_TOKEN, "login": "true", "theme": "system"}
+    refreshed_token = None
 
     with SB(**sb_kwargs) as sb:
         try:
@@ -1098,7 +1143,7 @@ def run():
             sb.open(f"{BASE}/")
             sb.wait_for_ready_state_complete()
             sb.sleep(1.5)
-            for name, value in COOKIES.items():
+            for name, value in cookies.items():
                 if value:
                     sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
             login_ok = goto_billings(sb)
@@ -1132,7 +1177,7 @@ def run():
                 error_msg = "SESSION_TOKEN 和 Discord OAuth 均失败"
             _FAILED = True
             notify("❌ 登录失败", error=error_msg)
-            return
+            return False, None
 
         # ---------- 到期日期 & 账号 ----------
         sb.sleep(1.5)
@@ -1181,22 +1226,71 @@ def run():
             save_debug_screenshot(sb, "renew_exception")
             notify("❌ 续期失败", error=f"续期流程异常: {str(e)[:150]}")
 
-        # ---------- 更新 SESSION_TOKEN ----------
+        # ---------- 收集刷新后的 SESSION_TOKEN（多账号跑完统一回写） ----------
         print("🔄 检查 SESSION_TOKEN 是否需要更新")
         new_token, token_expiry = get_cookie_info(sb, "session_token")
         if should_update_cookie(new_token, SESSION_TOKEN, token_expiry):
-            print("🔄 SESSION_TOKEN 需要更新")
-            if GH_TOKEN:
-                if update_github_secret("SESSION_TOKEN", new_token):
-                    print("✅ SESSION_TOKEN 更新成功")
-                else:
-                    print("⚠️ 更新失败，请检查 GH_TOKEN 权限")
-            else:
-                print("⚠️ 未设置 GH_TOKEN，无法自动更新")
+            print(f"🔄 SESSION_TOKEN 需要更新（新值: {mask_token(new_token)}，跑完统一回写）")
+            refreshed_token = new_token
         else:
             print("✅ SESSION_TOKEN 无需更新")
 
-        print("🏁 脚本执行完毕")
+        print("🏁 账号执行完毕")
+    return (not _FAILED), refreshed_token
+
+
+def run():
+    global _FAILED
+    print("#" * 28)
+    print("   Bot-hosting 自动续期 v4.0（多账号）")
+    print("#" * 28)
+
+    accounts = parse_accounts()
+    print(f"📋 共 {len(accounts)} 个账号")
+    sb_kwargs, is_proxy, proxy_server = build_sb_kwargs()
+
+    orig_tokens = [a["session_token"] for a in accounts]  # 回写前快照（循环会改全局变量）
+    any_failed = False
+    summary = []
+    for idx, acct in enumerate(accounts):
+        try:
+            ok, new_tok = run_account(acct, idx, len(accounts),
+                                      sb_kwargs, is_proxy, proxy_server)
+        except Exception as e:
+            print(f"❌ 账号 {idx + 1} 执行异常: {e}")
+            traceback.print_exc()
+            try:
+                notify("❌ 脚本异常", error=str(e)[:200])
+            except Exception:
+                pass
+            ok, new_tok = False, None
+        if new_tok:
+            acct["session_token"] = new_tok
+        summary.append((acct, ok))
+        any_failed = any_failed or not ok
+
+    # ---------- 统一回写 SESSION_TOKEN（按行拼接，一次写完） ----------
+    new_tokens = [a["session_token"] for a in accounts]
+    if new_tokens != orig_tokens:
+        if GH_TOKEN:
+            print("🔄 统一回写 SESSION_TOKEN Secret…")
+            if update_github_secret("SESSION_TOKEN", ACCOUNT_JOIN.join(new_tokens)):
+                print("✅ SESSION_TOKEN 回写成功")
+            else:
+                print("⚠️ 回写失败，请检查 GH_TOKEN 权限")
+                any_failed = True
+        else:
+            print("⚠️ 有账号刷新了 token，但未设置 GH_TOKEN，无法自动回写，请手动更新")
+    else:
+        print("✅ 所有账号的 SESSION_TOKEN 均无需更新")
+
+    print("\n" + "#" * 28)
+    for acct, ok in summary:
+        mark = "✅" if ok else "❌"
+        print(f"{mark} {acct['note'] or '账号'}: {'成功' if ok else '失败'}")
+    print("#" * 28)
+
+    _FAILED = any_failed
 
 
 def main():

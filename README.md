@@ -18,6 +18,26 @@
 | TG_BOT_TOKEN       | ❌ 可选  | Telegram Bot Token（用于发送通知）                      |
 | TG_CHAT_ID         | ❌ 可选  | Telegram Chat ID（接收通知的用户或群组 ID）               |
 
+### 多账号（v4.0+）
+`SESSION_TOKEN` 和 `DISCORD_TOKEN` 里一行写一个账号，按行号配对（第 1 行配第 1 行就是账号 1，以此类推）：
+
+```
+# SESSION_TOKEN
+账号1的session_token
+账号2的session_token
+账号3的session_token
+```
+```
+# DISCORD_TOKEN
+账号1的discord_token
+账号2的discord_token
+账号3的discord_token
+```
+- `DISCORD_TOKEN` 每行仍支持 `备注,token` 写法（备注只用于日志区分账号）
+- 每个账号用独立浏览器跑，cookie 不串号；单个账号失败不影响其他账号
+- 跑完后所有账号刷新掉的 token 一次性按行回写到 `SESSION_TOKEN` Secret（需配 `GH_TOKEN`）
+- 两边行数对不上会在日志里大声告警；只写一行就是单账号，和老版本完全兼容
+
 ━━━━━━━━━━━━━━━━━━━━━━
 
 ## 部署步骤
