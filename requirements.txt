@@ -1,2 +1,2 @@
-seleniumbase
-requests
+seleniumbase==4.56.1
+requests==2.34.2

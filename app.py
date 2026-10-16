@@ -8,8 +8,8 @@ Bot-hosting 自动续期
 
 环境变量：
   SESSION_TOKEN / DISCORD_TOKEN   登录凭据（至少一个）
-  EMAIL         可选，通知里显示的账号；未设置则自动从设置页读取
-  SERVER_URL    可选，服务详情页（/a/d/<uuid>）；未设置则自动发现
+  EMAIL         可选，仅单账号时用于通知显示；多账号时忽略，自动从设置页读取
+  SERVER_URL    可选，服务详情页（/a/d/<uuid>）；多账号时一行一个按行号配对；未设置则自动发现
   GH_TOKEN      可选，用于自动更新 SESSION_TOKEN Secret
   TG_BOT_TOKEN / TG_CHAT_ID       Telegram 通知
   IS_PROXY / PROXY_SERVER / HEADLESS
@@ -89,13 +89,18 @@ BASE = "https://bot-hosting.net"
 BILLINGS_URL = f"{BASE}/a/billings"
 # 可选：直接指定服务页，例如 https://bot-hosting.net/a/d/<uuid>（只填 /a/d/<uuid> 也可）
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
-SERVER_URL = (os.environ.get("SERVER_URL") or "").strip()
-if SERVER_URL.startswith("/"):
-    SERVER_URL = BASE + SERVER_URL
+SERVER_URL_LINES = [u.strip() for u in (os.environ.get("SERVER_URL") or "").splitlines()]
+SERVER_URL = ""  # 当前账号的服务页，在 run_account 里按行号设置
+
+
+def normalize_server_url(u: str) -> str:
+    u = (u or "").strip()
+    return BASE + u if u.startswith("/") else u
 # 服务详情页路径特征：/a/d/<uuid>
 SERVER_PATH_RE = re.compile(r"^/a/d/[0-9a-fA-F\-]{8,}")
 
 _LOGIN_METHOD = "SESSION_TOKEN"
+DC_TOKEN = ""
 _START_TIME = None
 _ACCOUNT = ""
 _APP_UPTIME = ""
@@ -411,6 +416,16 @@ def click_turnstile_checkbox_direct(sb) -> bool:
     return False
 
 
+def mask_ip(ip: str) -> str:
+    """公开仓库日志所有人可见：IPv4 只留前两段，IPv6 只留前两组"""
+    if not ip:
+        return "未知"
+    if "." in ip:
+        parts = ip.split(".")
+        return ".".join(parts[:2] + ["*", "*"])
+    return ":".join(ip.split(":")[:2]) + ":****"
+
+
 def get_current_ip(proxy_server: str = "") -> str:
     proxies = {"http": proxy_server, "https": proxy_server} if proxy_server else None
     resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
@@ -442,9 +457,11 @@ def extract_expiry_date(page_source: str) -> str | None:
         match = re.search(pattern, page_source)
         if match:
             parts = match.group(1).split("/")
-            # MM/DD/YYYY → YYYY/MM/DD
             if len(parts) == 3 and len(parts[0]) == 2 and len(parts[2]) == 4:
-                return f"{parts[2]}/{parts[0]}/{parts[1]}"
+                a, b, y = int(parts[0]), int(parts[1]), parts[2]
+                # 默认 MM/DD/YYYY；首段 > 12 说明是 DD/MM/YYYY
+                mm, dd = (b, a) if a > 12 else (a, b)
+                return f"{y}/{mm:02d}/{dd:02d}"
             return match.group(1)
     return None
 
@@ -861,47 +878,49 @@ def do_discord_login(sb) -> bool:
 COUNTDOWN_RE = re.compile(r"(?:Renew in|Renewal cooldown)\s+(\d{2}:\d{2}:\d{2})")
 
 
-def _renew_button_disabled(sb) -> bool:
-    """首个可见的 Renew 按钮是否被禁用（冷却中的按钮通常带 disabled）"""
-    try:
-        return bool(sb.execute_script(r"""
-            const el = Array.from(document.querySelectorAll('button, a'))
-                .find(e => e.offsetParent !== null && (e.innerText || '').includes('Renew'));
-            if (!el) return false;
-            return !!(el.disabled || el.getAttribute('aria-disabled') === 'true'
-                || /\bdisabled\b/i.test(el.className || ''));
-        """))
-    except Exception:
-        return False
-
-
 def find_renew_button(sb):
-    """返回 (selector, countdown)；二者至多一个非 None"""
-    selectors = [
-        'button:contains("Renew")',
-        'a:contains("Renew")',
-        '[class*="renew"]',
-        '[class*="Renew"]',
-    ]
-    for selector in selectors:
-        try:
-            if not sb.is_element_visible(selector):
-                continue
-            text = sb.get_text(selector)
-            m = COUNTDOWN_RE.search(text)
-            if m:
-                return None, m.group(1)
-            if "Renew" in text:
-                if _renew_button_disabled(sb):
-                    # 冷却中不可点的按钮：按倒计时处理，绝不当作可续期去点
-                    print(f"⏳ 续期按钮处于禁用/冷却状态: '{text}'")
-                    m2 = re.search(r"(\d{2}:\d{2}:\d{2})", text)
-                    return None, (m2.group(1) if m2 else None)
-                print(f"✅ 续期按钮可用: '{text}'")
-                return selector, None
-        except Exception:
-            continue
-    return None, None
+    """
+    返回 (selector, countdown)；二者至多一个非 None。
+    在同一个元素上同时判断：文案、倒计时、是否禁用，避免"找到 A 按钮却检查 B 按钮"的错位。
+    可点击时给该元素打上 data-renew-target 标记，返回对应 selector。
+    """
+    try:
+        info = sb.execute_script(r"""
+            document.querySelectorAll('[data-renew-target]')
+                .forEach(e => e.removeAttribute('data-renew-target'));
+            const cands = Array.from(document.querySelectorAll(
+                'button, a, [role="button"], [class*="renew"], [class*="Renew"]'))
+                .filter(e => e.offsetParent !== null
+                    && /Renew/.test(e.innerText || '')
+                    && !/Renew for \d+ days?/.test(e.innerText || ''));
+            for (const el of cands) {
+                const text = (el.innerText || '').trim().replace(/\s+/g, ' ');
+                const btn = el.closest('button, a, [role="button"]') || el;
+                const disabled = !!(btn.disabled
+                    || btn.getAttribute('aria-disabled') === 'true'
+                    || /\bdisabled\b/i.test(btn.className || ''));
+                if (!disabled && !/\d{2}:\d{2}:\d{2}/.test(text)) {
+                    btn.setAttribute('data-renew-target', '1');
+                }
+                return {text, disabled};
+            }
+            return null;
+        """)
+    except Exception as e:
+        print(f"⚠️ 查找续期按钮异常: {e}")
+        return None, None
+    if not info:
+        return None, None
+    text = info.get("text", "")
+    m = COUNTDOWN_RE.search(text)
+    if m:
+        return None, m.group(1)
+    if info.get("disabled"):
+        print(f"⏳ 续期按钮处于禁用/冷却状态: '{text}'")
+        m2 = re.search(r"(\d{2}:\d{2}:\d{2})", text)
+        return None, (m2.group(1) if m2 else None)
+    print(f"✅ 续期按钮可用: '{text}'")
+    return '[data-renew-target="1"]', None
 
 
 def notify(status, **kw):
@@ -1079,19 +1098,25 @@ def read_account_from_settings(sb) -> str:
     return ""
 
 
-def resolve_account(sb, page_source: str, visible_text: str) -> str:
-    """优先级：EMAIL 环境变量 → 设置页邮箱/用户名 → 页面文本中的真实邮箱"""
-    if EMAIL:
+def resolve_account(sb, page_source: str, visible_text: str, multi: bool) -> tuple[str, bool]:
+    """
+    返回 (账号, 是否可用于去重)。
+    单账号：EMAIL 环境变量 → 设置页 → 页面文本。
+    多账号：忽略 EMAIL（所有账号共用同一个 EMAIL，会导致第 2 个起全部被误判为重复），
+           只用设置页/页面里读到的真实身份。
+    EMAIL 环境变量是用户随意填的，永远不作为去重依据。
+    """
+    if EMAIL and not multi:
         print("👤 账号来源: EMAIL 环境变量")
-        return EMAIL
+        return EMAIL, False
     acc = read_account_from_settings(sb)
     if acc:
         print("👤 账号来源: 设置页")
-        return acc
+        return acc, True
     acc = extract_account_email(page_source, visible_text) or ""
     if acc:
         print("👤 账号来源: 页面文本")
-    return acc
+    return acc, bool(acc)
 
 
 # ==================== 主流程 ====================
@@ -1123,11 +1148,12 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server, seen_identi
     返回 (ok: 是否成功, new_session_token: 刷新后的 token / 失败占位符 / None=保持原样,
            skipped: 是否因重复而跳过)。
     """
-    global SESSION_TOKEN, DC_TOKEN
+    global SESSION_TOKEN, DC_TOKEN, SERVER_URL
     global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS, _LOGIN_METHOD, _FAILED
     orig_session = acct["session_token"]
     SESSION_TOKEN = orig_session
     DC_TOKEN = acct["discord_token"]
+    SERVER_URL = normalize_server_url(SERVER_URL_LINES[idx]) if idx < len(SERVER_URL_LINES) else ""
     _LOGIN_METHOD = "SESSION_TOKEN"
     _START_TIME = time.time()
     _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
@@ -1144,7 +1170,7 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server, seen_identi
 
     with SB(**sb_kwargs) as sb:
         try:
-            print(f"📍 当前出口 IP: {get_current_ip(proxy_server if is_proxy else '')}")
+            print(f"📍 当前出口 IP: {mask_ip(get_current_ip(proxy_server if is_proxy else ''))}")
         except Exception as e:
             print(f"⚠️ 获取出口 IP 失败: {e}")
 
@@ -1207,19 +1233,19 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server, seen_identi
         current_expiry = extract_expiry_date(page_source)
         print(f"📅 当前到期日期: {current_expiry}" if current_expiry else "⚠️ 未能提取当前到期日期")
 
-        _ACCOUNT = resolve_account(sb, page_source, body_text(sb))
+        _ACCOUNT, identity_ok = resolve_account(sb, page_source, body_text(sb), multi=total > 1)
         if _ACCOUNT:
             print(f"👤 登录账号: {mask_email(_ACCOUNT)}")
         else:
             print("⚠️ 未能识别登录账号，通知里将显示「未配置」")
 
         # ---------- 去重：同一 bot-hosting 账号本轮只处理一次 ----------
-        if _ACCOUNT:
-            if _ACCOUNT in seen_identities:
+        if _ACCOUNT and identity_ok:
+            if _ACCOUNT.lower() in seen_identities:
                 print(f"⚠️ 该账号本轮已处理过（{mask_email(_ACCOUNT)}），跳过避免重复操作")
                 notify("⏭️ 重复账号跳过", error=f"{mask_email(_ACCOUNT)} 本轮已处理过，跳过")
                 return True, None, True
-            seen_identities.add(_ACCOUNT)
+            seen_identities.add(_ACCOUNT.lower())
 
         # ---------- 机器状态：运行中跳过，明确关机才开机 ----------
         print("🔎 检测机器状态...")
@@ -1272,7 +1298,7 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server, seen_identi
 def run():
     global _FAILED
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v4.1（多账号）")
+    print("   Bot-hosting 自动续期 v4.2（多账号）")
     print("#" * 28)
 
     accounts = parse_accounts()
