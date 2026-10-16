@@ -813,7 +813,23 @@ def do_discord_login(sb) -> bool:
 
 
 # ==================== 续期核心 ====================
-COUNTDOWN_RE = re.compile(r"Renew in (\d{2}:\d{2}:\d{2})")
+# 倒计时文案有两种："Renew in HH:MM:SS"（续期成功后）和
+# "Renewal cooldown HH:MM:SS"（续期后冷却中，按钮不可点，2026-10-16 实测）
+COUNTDOWN_RE = re.compile(r"(?:Renew in|Renewal cooldown)\s+(\d{2}:\d{2}:\d{2})")
+
+
+def _renew_button_disabled(sb) -> bool:
+    """首个可见的 Renew 按钮是否被禁用（冷却中的按钮通常带 disabled）"""
+    try:
+        return bool(sb.execute_script(r"""
+            const el = Array.from(document.querySelectorAll('button, a'))
+                .find(e => e.offsetParent !== null && (e.innerText || '').includes('Renew'));
+            if (!el) return false;
+            return !!(el.disabled || el.getAttribute('aria-disabled') === 'true'
+                || /\bdisabled\b/i.test(el.className || ''));
+        """))
+    except Exception:
+        return False
 
 
 def find_renew_button(sb):
@@ -833,6 +849,11 @@ def find_renew_button(sb):
             if m:
                 return None, m.group(1)
             if "Renew" in text:
+                if _renew_button_disabled(sb):
+                    # 冷却中不可点的按钮：按倒计时处理，绝不当作可续期去点
+                    print(f"⏳ 续期按钮处于禁用/冷却状态: '{text}'")
+                    m2 = re.search(r"(\d{2}:\d{2}:\d{2})", text)
+                    return None, (m2.group(1) if m2 else None)
                 print(f"✅ 续期按钮可用: '{text}'")
                 return selector, None
         except Exception:
@@ -1045,7 +1066,7 @@ def run():
     _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v3.6")
+    print("   Bot-hosting 自动续期 v3.7")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
