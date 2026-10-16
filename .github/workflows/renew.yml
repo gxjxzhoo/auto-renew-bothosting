@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false  # 不把 GITHUB_TOKEN 留在 .git/config 里
 
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
@@ -38,7 +40,8 @@ jobs:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           if [ -n "$NODE_LINK" ]; then
-            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+            # 使用仓库内自带的脚本，不再在线下载执行第三方脚本
+            bash ./setup_proxy.sh
           else
             echo "未配置 NODE_LINK，跳过代理"
           fi
@@ -51,11 +54,13 @@ jobs:
           SESSION_TOKEN: ${{ secrets.SESSION_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SERVER_URL: ${{ secrets.SERVER_URL }}
+          GH_REPO: ${{ github.repository }}
         run: |
           xvfb-run --auto-servernum python3 app.py
 
-      - name: 📸 上传调试截图
-        if: always()
+      - name: 📸 上传调试截图（仅私有仓库，公开仓库的截图任何人都能下载）
+        if: always() && github.event.repository.private
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
@@ -72,6 +77,15 @@ jobs:
           pkill -f chrome || true
           pkill -f Xvfb || true
           rm -f sing-box sing-box-config.json sing-box.log || true
+
+      - name: 💓 保活（防止仓库 60 天无提交后定时任务被 GitHub 自动停用）
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/renew.yml/enable" \
+            && echo "✅ 已刷新工作流启用状态" || echo "⚠️ 保活失败（不影响续期）"
 
       - name: 🧹 清理旧的工作流运行记录（保留最近 5 条）
         if: always()
