@@ -242,9 +242,8 @@ def format_notification(
     account: str = "",
 ) -> str:
     display_account = mask_email(account or _ACCOUNT or EMAIL)
-    lines = ["🇫🇮 Bot-hosting 续期通知", "", status, f"👤 登录账户: {display_account}"]
-    if _LOGIN_METHOD != "SESSION_TOKEN":
-        lines.append(f"🔐 登录方式: {_LOGIN_METHOD}")
+    lines = ["🇫🇮 Bot-hosting 续期通知", "", status, f"👤 登录账户: {display_account}",
+             f"🔐 登录方式: {_LOGIN_METHOD}"]
     if expiry_date:
         lines.append(f"📅 到期时间: {expiry_date}")
     if extra:
@@ -1071,7 +1070,7 @@ def run():
     _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v3.8")
+    print("   Bot-hosting 自动续期 v3.9")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
