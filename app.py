@@ -18,6 +18,7 @@ Bot-hosting 自动续期
 
 import os
 import re
+import secrets
 import sys
 import traceback
 import time
@@ -37,19 +38,22 @@ GH_TOKEN = os.environ.get("GH_TOKEN") or ""
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 
-# 多账号：一行一个，SESSION_TOKEN / DISCORD_TOKEN 分别按行写，按行号配对
+# 多账号：一行一个，SESSION_TOKEN / DISCORD_TOKEN 分别按行写，严格按行号配对
+# 登录失败且该行原来是空行时，回写占位符，保证每行永远非空、位置永不错位
+FAILED_TOKEN_PREFIX = "FAILED_"
+
+
 def parse_accounts():
     """
-    解析多账号：SESSION_TOKEN / DISCORD_TOKEN 分别按行分隔，按行号配对；
+    解析多账号：SESSION_TOKEN / DISCORD_TOKEN 分别按行分隔，严格按行号配对；
+    空行不删除，作为占位符保留（短的补空），保证回写时位置不变；
     DISCORD_TOKEN 的每一行仍支持 "备注,token" 写法（备注仅用于日志区分账号）。
     返回 [{"session_token":..., "discord_token":..., "note":...}, ...]，
-    空行会被忽略。
+    两边都空的行会被剔除。
     """
     sess = [t.strip() for t in SESSION_TOKEN.splitlines()] if SESSION_TOKEN else []
     disc = [t.strip() for t in DISCORD_TOKEN.splitlines()] if DISCORD_TOKEN else []
-    sess = [t for t in sess if t]
-    disc = [t for t in disc if t]
-    if sess and disc and len(sess) != len(disc):
+    if len(sess) != len(disc):
         # 行数对不上极可能是漏贴了一行，大声告警（缺的按空补齐，不静默错配）
         print(f"⚠️ SESSION_TOKEN 有 {len(sess)} 行，DISCORD_TOKEN 有 {len(disc)} 行，"
               f"按行号配对，缺的用空补齐——请检查是否漏贴了一行！")
@@ -64,7 +68,13 @@ def parse_accounts():
             note, tok = "", d
         accounts.append({"session_token": s, "discord_token": tok.strip(),
                          "note": note.strip()})
-    return [a for a in accounts if a["session_token"] or a["discord_token"]]
+    # 注意：两边都空的行也保留占位，保证回写时行号永不错位；循环里跳过即可
+    return accounts
+
+
+def is_failed_placeholder(tok):
+    """是否为登录失败的占位符（不是真 token）"""
+    return bool(tok) and tok.startswith(FAILED_TOKEN_PREFIX)
 
 
 # 回写 SESSION_TOKEN 时多账号用换行拼接
@@ -1107,14 +1117,16 @@ def build_sb_kwargs():
     return sb_kwargs, is_proxy, proxy_server
 
 
-def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server):
+def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server, seen_identities):
     """
     单个账号完整流程。每个账号用全新浏览器上下文（cookie 不串号）。
-    返回 (ok: 是否成功, new_session_token: 刷新后的 token 或 None)。
+    返回 (ok: 是否成功, new_session_token: 刷新后的 token / 失败占位符 / None=保持原样,
+           skipped: 是否因重复而跳过)。
     """
     global SESSION_TOKEN, DC_TOKEN
     global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS, _LOGIN_METHOD, _FAILED
-    SESSION_TOKEN = acct["session_token"]
+    orig_session = acct["session_token"]
+    SESSION_TOKEN = orig_session
     DC_TOKEN = acct["discord_token"]
     _LOGIN_METHOD = "SESSION_TOKEN"
     _START_TIME = time.time()
@@ -1126,6 +1138,7 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server):
     print(f"   {tag}")
     print("=" * 28)
 
+    has_real_session = bool(SESSION_TOKEN) and not is_failed_placeholder(SESSION_TOKEN)
     cookies = {"session_token": SESSION_TOKEN, "login": "true", "theme": "system"}
     refreshed_token = None
 
@@ -1138,7 +1151,10 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server):
         login_ok = False
 
         # ---------- 方式1：SESSION_TOKEN ----------
-        if SESSION_TOKEN:
+        # 占位符不是真 token，直接跳过，省一次页面加载
+        if not has_real_session and DC_TOKEN:
+            print("ℹ️ 该行无有效 cookie，直接走 Discord 登录")
+        if has_real_session:
             print("🚀 启动浏览器并注入 Cookie...")
             sb.open(f"{BASE}/")
             sb.wait_for_ready_state_complete()
@@ -1169,7 +1185,7 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server):
                 print("❌ Discord OAuth 登录失败")
 
         if not login_ok:
-            if not SESSION_TOKEN:
+            if not has_real_session:
                 error_msg = "Discord OAuth 登录失败"
             elif not DC_TOKEN:
                 error_msg = "SESSION_TOKEN 失效且未配置 Discord Token"
@@ -1177,7 +1193,13 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server):
                 error_msg = "SESSION_TOKEN 和 Discord OAuth 均失败"
             _FAILED = True
             notify("❌ 登录失败", error=error_msg)
-            return False, None
+            # 登录完全失败：原来是空行才写占位符（保证每行非空、位置不错位）；
+            # 原来有 token 的保持不动，避免网络抖动时覆盖有效 token
+            if not orig_session:
+                placeholder = FAILED_TOKEN_PREFIX + secrets.token_hex(4)
+                print(f"🔖 登录失败且该行无 token，写占位符: {placeholder}")
+                return False, placeholder, False
+            return False, None, False
 
         # ---------- 到期日期 & 账号 ----------
         sb.sleep(1.5)
@@ -1190,6 +1212,14 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server):
             print(f"👤 登录账号: {mask_email(_ACCOUNT)}")
         else:
             print("⚠️ 未能识别登录账号，通知里将显示「未配置」")
+
+        # ---------- 去重：同一 bot-hosting 账号本轮只处理一次 ----------
+        if _ACCOUNT:
+            if _ACCOUNT in seen_identities:
+                print(f"⚠️ 该账号本轮已处理过（{mask_email(_ACCOUNT)}），跳过避免重复操作")
+                notify("⏭️ 重复账号跳过", error=f"{mask_email(_ACCOUNT)} 本轮已处理过，跳过")
+                return True, None, True
+            seen_identities.add(_ACCOUNT)
 
         # ---------- 机器状态：运行中跳过，明确关机才开机 ----------
         print("🔎 检测机器状态...")
@@ -1236,26 +1266,32 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server):
             print("✅ SESSION_TOKEN 无需更新")
 
         print("🏁 账号执行完毕")
-    return (not _FAILED), refreshed_token
+    return (not _FAILED), refreshed_token, False
 
 
 def run():
     global _FAILED
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v4.0（多账号）")
+    print("   Bot-hosting 自动续期 v4.1（多账号）")
     print("#" * 28)
 
     accounts = parse_accounts()
-    print(f"📋 共 {len(accounts)} 个账号")
+    configured = [a for a in accounts if a["session_token"] or a["discord_token"]]
+    print(f"📋 共 {len(configured)} 个账号（{len(accounts)} 行）")
     sb_kwargs, is_proxy, proxy_server = build_sb_kwargs()
 
     orig_tokens = [a["session_token"] for a in accounts]  # 回写前快照（循环会改全局变量）
+    seen_identities = set()  # 本轮已处理过的 bot-hosting 账号（防重复）
     any_failed = False
     summary = []
     for idx, acct in enumerate(accounts):
+        if not acct["session_token"] and not acct["discord_token"]:
+            print(f"\n⏭️ 第 {idx + 1} 行未配置，跳过")
+            continue
         try:
-            ok, new_tok = run_account(acct, idx, len(accounts),
-                                      sb_kwargs, is_proxy, proxy_server)
+            ok, new_tok, skipped = run_account(acct, idx, len(accounts),
+                                               sb_kwargs, is_proxy, proxy_server,
+                                               seen_identities)
         except Exception as e:
             print(f"❌ 账号 {idx + 1} 执行异常: {e}")
             traceback.print_exc()
@@ -1263,10 +1299,10 @@ def run():
                 notify("❌ 脚本异常", error=str(e)[:200])
             except Exception:
                 pass
-            ok, new_tok = False, None
+            ok, new_tok, skipped = False, None, False
         if new_tok:
             acct["session_token"] = new_tok
-        summary.append((acct, ok))
+        summary.append((acct, ok, skipped))
         any_failed = any_failed or not ok
 
     # ---------- 统一回写 SESSION_TOKEN（按行拼接，一次写完） ----------
@@ -1285,9 +1321,12 @@ def run():
         print("✅ 所有账号的 SESSION_TOKEN 均无需更新")
 
     print("\n" + "#" * 28)
-    for acct, ok in summary:
-        mark = "✅" if ok else "❌"
-        print(f"{mark} {acct['note'] or '账号'}: {'成功' if ok else '失败'}")
+    for acct, ok, skipped in summary:
+        if skipped:
+            mark, word = "⏭️", "跳过（重复）"
+        else:
+            mark, word = ("✅", "成功") if ok else ("❌", "失败")
+        print(f"{mark} {acct['note'] or '账号'}: {word}")
     print("#" * 28)
 
     _FAILED = any_failed
