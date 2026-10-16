@@ -641,11 +641,15 @@ def check_and_manage_server(sb) -> tuple[str, str]:
     """
     返回 (status, uptime)
     status: running / started / start_failed / unknown
-    - running  → 记录时长
+    - running  → 记录时长（时长一律以服务页为准）
     - stopped  → 进入详情页后点 Start
     - unknown  → 尝试进详情页再判断；仍未知则不操作
-    关键：总览页即使显示 OFFLINE/Stopped，也必须先进入 /a/d/<uuid>
-          详情页才有 Start 按钮，总览页点不到。
+    关键：
+    1. 总览页即使显示 OFFLINE/Stopped，也必须先进入 /a/d/<uuid>，
+       详情页才有 Start 按钮，总览页点不到。
+    2. 总览页卡片的时长不可靠（2026-10-16 实测：总览页读 31天19小时，
+       服务页读 26天10小时且与真实流逝一致），所以只要没指定 SERVER_URL，
+       一律进服务页拿状态和时长，不再信任总览页的 running 早退。
     """
     start_url = SERVER_URL or f"{BASE}/a/"
     sb.open(start_url)
@@ -654,15 +658,15 @@ def check_and_manage_server(sb) -> tuple[str, str]:
     on_detail = is_detail_page(sb)
     print(f"📊 {'服务页' if on_detail or SERVER_URL else '总览页'}状态: {st}, 时长: {up or '无'}")
 
-    if st == "running" or up:
-        return "running", up
-
-    # 不在详情页时，一律先找 /a/d/<uuid> 进入（无论 stopped 还是 unknown）
+    # 不在详情页时，一律先找 /a/d/<uuid> 进入（无论 running / stopped / unknown）
     if not on_detail and not SERVER_URL:
         href = find_server_link(sb)
         if not href:
             print("⚠️ 未找到服务器链接 (/a/d/...)")
             dump_debug(sb, "no_server_link")
+            # 退回总览页的判断（有总比没有好）
+            if st == "running" or up:
+                return "running", up
             return "unknown", ""
         print(f"➡️ 进入服务页: {redact(href)}")
         sb.open(BASE + href if href.startswith("/") else href)
@@ -670,8 +674,9 @@ def check_and_manage_server(sb) -> tuple[str, str]:
         st, up, text = read_state(sb)
         on_detail = is_detail_page(sb)
         print(f"📊 服务页状态: {st}, 时长: {up or '无'} (detail={on_detail})")
-        if st == "running" or up:
-            return "running", up
+
+    if st == "running" or up:
+        return "running", up
 
     if st != "stopped":
         print("⚠️ 状态无法确认，不执行开机")
@@ -1066,7 +1071,7 @@ def run():
     _ACCOUNT = _APP_UPTIME = _SERVER_STATUS = ""
 
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v3.7")
+    print("   Bot-hosting 自动续期 v3.8")
     print("#" * 28)
 
     is_proxy = os.environ.get("IS_PROXY", "false").lower() == "true"
