@@ -40,6 +40,13 @@ jobs:
           fi
           rm -rf .shared-env
 
+      - name: 启动代理（Node_Proxy）
+        id: nodeproxy
+        continue-on-error: true
+        uses: gxjxzhoo/Node_Proxy@v1
+        with:
+          node-link: ${{ env.NODE_LINK || secrets.NODE_LINK }}
+
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
@@ -60,7 +67,10 @@ jobs:
         env:
           NODE_LINK: ${{ env.NODE_LINK || secrets.NODE_LINK }}
         run: |
-          if [ -n "$NODE_LINK" ]; then
+          if [ -n "$NODE_PROXY_URL" ]; then
+            echo "使用 Node_Proxy Action 提供的本地代理"
+            { echo "IS_PROXY=true"; echo "PROXY_SERVER=socks5://${NODE_PROXY_URL#*://}"; } >> "$GITHUB_ENV"
+          elif [ -n "$NODE_LINK" ]; then
             # 使用仓库内自带的脚本，不再在线下载执行第三方脚本
             bash ./setup_proxy.sh
           else
