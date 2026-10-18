@@ -18,6 +18,27 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false  # 不把 GITHUB_TOKEN 留在 .git/config 里
+      - name: Load shared env (env-config)
+        uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: gxjxzhoo/env-config
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: .shared-env
+      - name: Apply shared env
+        shell: bash
+        run: |
+          f=.shared-env/.env
+          if [ -f "$f" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              case "$line" in ''|\#*) continue ;; esac
+              key="${line%%=*}"; value="${line#*=}"
+              [ -z "$value" ] && continue
+              echo "::add-mask::$value"
+              echo "$key=$value" >> "$GITHUB_ENV"
+            done < "$f"
+          fi
+          rm -rf .shared-env
 
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
@@ -37,7 +58,7 @@ jobs:
       - name: 🔗 设置代理 (sing-box)
         continue-on-error: true
         env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
+          NODE_LINK: ${{ env.NODE_LINK || secrets.NODE_LINK }}
         run: |
           if [ -n "$NODE_LINK" ]; then
             # 使用仓库内自带的脚本，不再在线下载执行第三方脚本
@@ -52,8 +73,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           SESSION_TOKEN: ${{ secrets.SESSION_TOKEN }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_BOT_TOKEN: ${{ env.TG_BOT_TOKEN || secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ env.TG_CHAT_ID || secrets.TG_CHAT_ID }}
           SERVER_URL: ${{ secrets.SERVER_URL }}
           GH_REPO: ${{ github.repository }}
         run: |
