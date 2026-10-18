@@ -80,7 +80,7 @@ jobs:
       - name: 🚀 运行续期脚本
         env:
           EMAIL: ${{ secrets.EMAIL }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ env.GH_TOKEN || secrets.GH_TOKEN }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           SESSION_TOKEN: ${{ secrets.SESSION_TOKEN }}
           TG_BOT_TOKEN: ${{ env.TG_BOT_TOKEN || secrets.TG_BOT_TOKEN }}
