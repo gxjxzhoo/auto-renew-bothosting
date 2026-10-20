@@ -1498,7 +1498,7 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server, seen_identi
         # ---------- 收集刷新后的 SESSION_TOKEN（多账号跑完统一回写） ----------
         print("🔄 检查 SESSION_TOKEN 是否需要更新")
         new_token, token_expiry = get_cookie_info(sb, "session_token")
-        if should_update_cookie(new_token, SESSION_TOKEN, token_expiry):
+        if should_update_cookie(new_token, acct.get("session_token", ""), token_expiry):
             print(f"🔄 SESSION_TOKEN 需要更新（新值: {mask_token(new_token)}，跑完统一回写）")
             refreshed_token = new_token
         else:
