@@ -287,7 +287,7 @@ def format_notification(
     account: str = "",
 ) -> str:
     display_account = mask_email(account or _ACCOUNT or EMAIL)
-    lines = ["🇫🇮 Bot-hosting 续期通知", "", status, f"👤 登录账户: {display_account}",
+    lines = [status, f"👤 登录账户: {display_account}",
              f"🔐 登录方式: {_LOGIN_METHOD}"]
     if _EXIT_IP:
         lines.append(f"🌐 出口IP: {_EXIT_IP}")
@@ -309,7 +309,6 @@ def format_notification(
         lines.append(f"⏳ 运行时长: {_APP_UPTIME}")
     if _START_TIME is not None:
         lines.append(f"🕒 脚本耗时: {format_duration(time.time() - _START_TIME)}")
-    lines.append(f"⏱️ 执行时间: {now_cn()}")
     return "\n".join(lines)
 
 
@@ -362,13 +361,13 @@ def turnstile_solved(sb) -> bool:
     注意：找不到控件不能当作通过——iframe 是弹窗出现后才异步加载的，
     刚打开弹窗时找不到控件很常见，但此时锁定文案已经在了。
     """
+    st = modal_state(sb)
+    if not st.get("confirm"):
+        # 弹窗已关闭（常见于 GUI 点击偏到遮罩层），锁定文案随之消失，不能当作通过
+        return False
     if turnstile_token_ready(sb) is True:
         return True
-    try:
-        text = " ".join((sb.get_text("body") or "").split()).lower()
-    except Exception:
-        return False
-    return BOT_CHECK_LOCK_TEXT.lower() not in text
+    return (not st.get("lock")) and not st.get("disabled")
 
 
 def wait_for_turnstile_pass(sb, timeout: int = 30) -> bool:
@@ -378,8 +377,61 @@ def wait_for_turnstile_pass(sb, timeout: int = 30) -> bool:
         if turnstile_solved(sb):
             print("✅ Turnstile 验证已通过")
             return True
+        if not modal_state(sb).get("confirm"):
+            print("⚠️ 续期弹窗已关闭")
+            return False
         sb.sleep(1)
     print("❌ Turnstile 验证超时未通过")
+    return False
+
+
+def click_turnstile_by_coords(sb) -> bool:
+    """
+    按 Turnstile iframe 的实际位置做系统级点击（复选框在 widget 左侧约 30px）。
+    uc_gui_click_captcha 只认 .cf-turnstile-wrapper，弹窗里的裸 Turnstile 会被它点偏到遮罩层，
+    导致弹窗关闭（2026-10-21 日志：点击后弹窗内容为空）。
+    """
+    try:
+        pos = sb.execute_script(r"""
+            const f = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            if (!f) return null;
+            f.scrollIntoView({block: 'center'});
+            const r = f.getBoundingClientRect();
+            if (r.width < 10 || r.height < 10) return null;
+            const dpr = window.devicePixelRatio || 1;
+            const bar = window.outerHeight - window.innerHeight;
+            return {
+                x: (window.screenX + r.left + Math.min(30, r.width / 2)) * dpr,
+                y: (window.screenY + bar + r.top + r.height / 2) * dpr,
+            };
+        """)
+        if not pos:
+            print("⚠️ 未找到可见的 Turnstile iframe")
+            return False
+        sb.uc_gui_click_x_y(pos["x"], pos["y"])
+        print(f"🖱️ 按坐标点击 Turnstile ({int(pos['x'])}, {int(pos['y'])})")
+        return True
+    except Exception as e:
+        print(f"⚠️ 按坐标点击 Turnstile 失败: {e}")
+        return False
+
+
+def reopen_renew_modal(sb) -> bool:
+    """弹窗被意外关闭时重新打开"""
+    sel, _ = find_renew_button(sb)
+    if not sel:
+        return False
+    try:
+        sb.click(sel)
+    except Exception:
+        return False
+    end = time.time() + 15
+    while time.time() < end:
+        if modal_state(sb).get("confirm"):
+            print("🔁 已重新打开续期弹窗")
+            sb.sleep(3)
+            return True
+        sb.sleep(1)
     return False
 
 
@@ -988,8 +1040,30 @@ def renewed_already(sb, current_expiry: str | None):
     return None
 
 
+_TG_BLOCKS: list[str] = []  # 各账号通知先缓存，跑完合并成一条推送
+
+
 def notify(status, **kw):
-    send_telegram_message(format_notification(status, **kw))
+    _TG_BLOCKS.append(format_notification(status, **kw))
+
+
+def flush_notifications():
+    """把本轮所有账号的通知合并成一条 Telegram 消息（超 4000 字自动分段）"""
+    if not _TG_BLOCKS:
+        return
+    header = f"🇫🇮 Bot-hosting 续期通知（{len(_TG_BLOCKS)} 条）"
+    footer = f"⏱️ 执行时间: {now_cn()}"
+    parts, cur = [], header
+    for b in _TG_BLOCKS:
+        piece = "\n\n" + b
+        if len(cur) + len(piece) > 3900:
+            parts.append(cur)
+            cur = header + "（续）"
+        cur += piece
+    parts.append(cur + "\n\n" + footer)
+    for p in parts:
+        send_telegram_message(p)
+    _TG_BLOCKS.clear()
 
 
 def do_renew(sb, current_expiry: str | None) -> bool:
@@ -1028,35 +1102,49 @@ def do_renew(sb, current_expiry: str | None) -> bool:
     print("🔒 处理 Turnstile 验证...")
     passed = False
     for attempt in range(1, 4):
-        # 每次先看是否已经通过（有 token 或弹窗已解锁）
-        if wait_for_turnstile_pass(sb, timeout=5):
+        # 弹窗被意外关闭则先重新打开（关闭后可能其实已续期）
+        if not modal_state(sb).get("confirm"):
+            if renewed_already(sb, current_expiry):
+                break
+            if not reopen_renew_modal(sb):
+                print("⚠️ 无法重新打开续期弹窗")
+                break
+        if wait_for_turnstile_pass(sb, timeout=8):
             passed = True
             break
-        # 方式1：seleniumbase 的 GUI 点击（标准 wrapper 结构有效）
-        try:
-            sb.uc_gui_click_captcha()
-            print(f"🖱️ 第 {attempt} 次 GUI 点击 Turnstile")
-        except Exception as e:
-            print(f"⚠️ 第 {attempt} 次 GUI 点击 Turnstile 出错: {e}")
-        if wait_for_turnstile_pass(sb, timeout=10):
-            passed = True
-            break
-        # 方式2：uc_gui_handle_captcha（较新版本 SeleniumBase 才有）
-        try:
-            if hasattr(sb, "uc_gui_handle_captcha"):
-                sb.uc_gui_handle_captcha()
-                print(f"🖱️ 第 {attempt} 次 uc_gui_handle_captcha")
-        except Exception as e:
-            print(f"⚠️ 第 {attempt} 次 uc_gui_handle_captcha 出错: {e}")
-        if wait_for_turnstile_pass(sb, timeout=10):
-            passed = True
-            break
+        # 方式1：按 iframe 实际坐标做系统级点击（弹窗内裸 Turnstile 最可靠）
+        if modal_state(sb).get("confirm") and click_turnstile_by_coords(sb):
+            if wait_for_turnstile_pass(sb, timeout=15):
+                passed = True
+                break
+        log_modal(sb, f"第{attempt}次坐标点击后")
+        # 方式2：seleniumbase GUI 点击（仅弹窗仍开着时）
+        if modal_state(sb).get("confirm"):
+            try:
+                sb.uc_gui_click_captcha()
+                print(f"🖱️ 第 {attempt} 次 GUI 点击 Turnstile")
+            except Exception as e:
+                print(f"⚠️ 第 {attempt} 次 GUI 点击 Turnstile 出错: {e}")
+            if wait_for_turnstile_pass(sb, timeout=10):
+                passed = True
+                break
+            log_modal(sb, f"第{attempt}次GUI点击后")
         # 方式3：直接进 iframe 点复选框（兜底）
-        click_turnstile_checkbox_direct(sb)
-        if wait_for_turnstile_pass(sb, timeout=20):
-            passed = True
-            break
+        if modal_state(sb).get("confirm"):
+            click_turnstile_checkbox_direct(sb)
+            if wait_for_turnstile_pass(sb, timeout=15):
+                passed = True
+                break
         print(f"⏳ 第 {attempt} 次未通过，重试...")
+
+    if not passed:
+        done = renewed_already(sb, current_expiry)
+        if done:
+            cd, exp = done
+            print(f"✅ 弹窗已关闭但已续期（倒计时 {cd}，到期 {exp}）")
+            notify("✅ 续期成功", extra=(f"⏱️ 可续期时间: {format_countdown(cd)}后" if cd else "到期日期已更新"),
+                   expiry_date=exp or "（未获取到）")
+            return True
 
     if not passed:
         _FAILED = True
@@ -1452,6 +1540,7 @@ def main():
     try:
         run()
     except SystemExit:
+        flush_notifications()
         raise
     except Exception as e:
         print(f"❌ 脚本异常: {e}")
@@ -1460,7 +1549,9 @@ def main():
             notify("❌ 脚本异常", error=str(e)[:200])
         except Exception:
             pass
+        flush_notifications()
         sys.exit(1)
+    flush_notifications()
     if _FAILED:
         print("❌ 存在失败步骤，退出码 1")
         sys.exit(1)
