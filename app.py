@@ -926,6 +926,68 @@ def find_renew_button(sb):
     return '[data-renew-target="1"]', None
 
 
+CONFIRM_SEL = '[data-renew-confirm="1"]'
+
+
+def modal_state(sb) -> dict:
+    """
+    续期弹窗状态（不依赖固定文案）：
+    confirm = 可见的「Renew for N day(s)」按钮文字（打上 data-renew-confirm 标记），无则 None
+    disabled = 该按钮是否禁用；lock = 是否还显示 bot check 锁定文案
+    dialog = 弹窗可见文本（截断，用于日志定位）
+    """
+    try:
+        return sb.execute_script(r"""
+            document.querySelectorAll('[data-renew-confirm]')
+                .forEach(e => e.removeAttribute('data-renew-confirm'));
+            const btns = Array.from(document.querySelectorAll('button, [role="button"], a'))
+                .filter(e => e.offsetParent !== null
+                    && /Renew\s+for\s+\d+\s*days?/i.test(e.innerText || ''));
+            const b = btns[0] || null;
+            if (b) b.setAttribute('data-renew-confirm', '1');
+            const dlg = document.querySelector('[role="dialog"], [aria-modal="true"], .modal, [class*="modal"], [class*="Modal"]');
+            const body = (document.body.innerText || '');
+            return {
+                confirm: b ? (b.innerText || '').trim().replace(/\s+/g, ' ') : null,
+                disabled: b ? !!(b.disabled || b.getAttribute('aria-disabled') === 'true') : null,
+                lock: /Complete the bot check/i.test(body),
+                dialog: dlg ? (dlg.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 300) : null,
+            };
+        """) or {}
+    except Exception as e:
+        return {"error": str(e)[:100]}
+
+
+def log_modal(sb, tag: str) -> dict:
+    st = modal_state(sb)
+    print(f"🔍 [{tag}] 弹窗状态: confirm={st.get('confirm')!r} disabled={st.get('disabled')} "
+          f"lock={st.get('lock')} dialog={redact(st.get('dialog') or '')!r}")
+    return st
+
+
+def wait_confirm_button(sb, timeout: int = 20) -> dict:
+    """等待可点击的确认续期按钮出现；返回最后一次 modal_state"""
+    end = time.time() + timeout
+    st = {}
+    while time.time() < end:
+        st = modal_state(sb)
+        if st.get("confirm") and not st.get("disabled"):
+            return st
+        sb.sleep(1)
+    return st
+
+
+def renewed_already(sb, current_expiry: str | None):
+    """弹窗内按钮消失时判断是否其实已续期（如键盘方式过验证时顺带触发了确认按钮）"""
+    page = sb.get_page_source()
+    m = COUNTDOWN_RE.search(page)
+    exp = extract_expiry_date(page)
+    toast = re.search(r"Renewed for \d+ days?", page)  # 成功提示「Renewed for 4 days.」（2026-10-21 手动实测）
+    if m or toast or (exp and current_expiry and exp != current_expiry):
+        return (m.group(1) if m else None), exp
+    return None
+
+
 def notify(status, **kw):
     send_telegram_message(format_notification(status, **kw))
 
@@ -948,7 +1010,14 @@ def do_renew(sb, current_expiry: str | None) -> bool:
     print("🔄 点击外部续期按钮...")
     try:
         sb.click(outer_selector)
-        sb.wait_for_element_visible('button:contains("Renew for 4 days")', timeout=20)
+        if not modal_state(sb).get("confirm"):
+            end = time.time() + 20
+            while time.time() < end and not modal_state(sb).get("confirm"):
+                sb.sleep(1)
+        if not modal_state(sb).get("confirm"):
+            log_modal(sb, "点击外部按钮后")
+            raise RuntimeError("20s 内未出现「Renew for N days」按钮")
+        log_modal(sb, "弹窗打开")
     except Exception as e:
         print(f"❌ 点击外部按钮或等待模态框失败: {e}")
         _FAILED = True
@@ -995,9 +1064,24 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         notify("❌ 续期失败", error="Turnstile 验证未通过（复选框未完成，续期按钮处于锁定状态）")
         return False
 
-    print("⏳ 点击「Renew for 4 days」...")
+    st = wait_confirm_button(sb, timeout=20)
+    log_modal(sb, "验证通过后")
+    if not st.get("confirm"):
+        done = renewed_already(sb, current_expiry)
+        if done:
+            cd, exp = done
+            print(f"✅ 确认按钮已消失但已续期（倒计时 {cd}，到期 {exp}）")
+            notify("✅ 续期成功", extra=(f"⏱️ 可续期时间: {format_countdown(cd)}后" if cd else "到期日期已更新"),
+                   expiry_date=exp or "（未获取到）")
+            return True
+    print(f"⏳ 点击「{st.get('confirm') or 'Renew for N days'}」...")
     try:
-        sb.click('button:contains("Renew for 4 days")', timeout=10)
+        if not st.get("confirm"):
+            raise RuntimeError("验证通过后 20s 内未找到可点击的确认续期按钮")
+        try:
+            sb.click(CONFIRM_SEL, timeout=5)
+        except Exception:
+            sb.js_click(CONFIRM_SEL)
         print("✅ 已点击续期按钮")
     except Exception as e:
         print(f"❌ 点击续期按钮失败: {e}")
@@ -1015,7 +1099,7 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         new_expiry = extract_expiry_date(new_page)
         new_match = COUNTDOWN_RE.search(new_page)
         try:
-            modal_open = sb.is_element_visible('button:contains("Renew for 4 days")')
+            modal_open = bool(modal_state(sb).get("confirm"))
         except Exception:
             modal_open = True
         if new_match or (new_expiry and new_expiry != current_expiry):
