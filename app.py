@@ -650,7 +650,8 @@ def wait_page_ready(sb, timeout: int = 20) -> str:
                 return body_text(sb)
         else:
             stopped_since = None
-            if st != "unknown" or slots:
+            # 服务页状态徽章不一定带「Running」字样，但读到运行时长即可确认（省去 20s 空等）
+            if st != "unknown" or slots or extract_app_uptime(text):
                 sb.sleep(1.5)
                 return body_text(sb)
         sb.sleep(1)
