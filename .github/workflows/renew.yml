@@ -18,14 +18,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false  # 不把 GITHUB_TOKEN 留在 .git/config 里
-      - name: Load shared env (env-config)
+      - name: 加载共享变量（env-config）
         uses: actions/checkout@v4
         continue-on-error: true
         with:
           repository: gxjxzhoo/env-config
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           path: .shared-env
-      - name: Apply shared env
+          persist-credentials: false
+
+      - name: 应用共享变量
         shell: bash
         run: |
           f=.shared-env/.env
@@ -37,6 +39,9 @@ jobs:
               echo "::add-mask::$value"
               echo "$key=$value" >> "$GITHUB_ENV"
             done < "$f"
+            echo "✅ 已加载 env-config"
+          else
+            echo "⚠️ 未读到 env-config（检查 PRIVATE_REPO_TOKEN），使用仓库 Secrets"
           fi
           rm -rf .shared-env
 
@@ -109,26 +114,27 @@ jobs:
           pkill -f Xvfb || true
           rm -f sing-box sing-box-config.json sing-box.log || true
 
-      - name: 💓 保活（防止仓库 60 天无提交后定时任务被 GitHub 自动停用）
+      - name: 保活（刷新工作流启用状态，防 60 天无活动被停用）
         if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/renew.yml/enable" \
-            && echo "✅ 已刷新工作流启用状态" || echo "⚠️ 保活失败（不影响续期）"
+          wf=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .workflow_id)
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/enable" \
+            && echo "✅ 已刷新工作流启用状态" || echo "⚠️ 保活失败（不影响主任务）"
 
-      - name: 🧹 清理旧的工作流运行记录（保留最近 5 条）
+      - name: 清理旧运行记录（保留最近 5 条）
         if: always()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          KEEP: "5"
         run: |
-          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=50 --json databaseId --jq '.[].databaseId' 2>/dev/null || true)
-          count=0
-          for run_id in $runs; do
-            count=$((count + 1))
-            if [ $count -gt 5 ]; then
-              echo "删除运行记录: $run_id"
-              gh run delete $run_id || true
-            fi
-          done
+          wf=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .workflow_id)
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?per_page=100" \
+            --jq '.workflow_runs[] | select(.status == "completed") | .id' \
+            | grep -vx "$GITHUB_RUN_ID" | tail -n +"$KEEP" \
+            | while read -r id; do
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$id" >/dev/null && echo "已删除运行 $id"
+              done || true
