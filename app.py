@@ -385,47 +385,6 @@ def wait_for_turnstile_pass(sb, timeout: int = 30) -> bool:
     return False
 
 
-def click_turnstile_by_coords(sb) -> bool:
-    """
-    按 Turnstile iframe 的实际位置做系统级点击（复选框在 widget 左侧约 30px）。
-    uc_gui_click_captcha 只认 .cf-turnstile-wrapper，弹窗里的裸 Turnstile 会被它点偏到遮罩层，
-    导致弹窗关闭（2026-10-21 日志：点击后弹窗内容为空）。
-    """
-    try:
-        pos = sb.execute_script(r"""
-            // iframe 常在 closed shadow DOM 里查不到，改找弹窗内约 300x65 的 widget 宿主元素
-            let f = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
-            if (!f) {
-                const root = document.querySelector('[role="dialog"], [aria-modal="true"]') || document.body;
-                const c = Array.from(root.querySelectorAll('div, span'))
-                    .filter(e => { const r = e.getBoundingClientRect();
-                        return r.width >= 280 && r.width <= 320 && r.height >= 55 && r.height <= 80; });
-                f = c[c.length - 1] || null;
-            }
-            if (!f) return null;
-            f.scrollIntoView({block: 'center'});
-            const r = f.getBoundingClientRect();
-            if (r.width < 10 || r.height < 10) return null;
-            const dpr = window.devicePixelRatio || 1;
-            const bar = window.outerHeight - window.innerHeight;
-            return {
-                x: (window.screenX + r.left + Math.min(30, r.width / 2)) * dpr,
-                y: (window.screenY + bar + r.top + r.height / 2) * dpr,
-            };
-        """)
-        if not pos:
-            print("⚠️ 未找到可见的 Turnstile iframe")
-            return False
-        sb.uc_gui_click_x_y(pos["x"], pos["y"])
-        print(f"🖱️ 按坐标点击 Turnstile ({int(pos['x'])}, {int(pos['y'])})")
-        return True
-    except Exception as e:
-        print(f"⚠️ 按坐标点击 Turnstile 失败: {e}")
-        return False
-    finally:
-        ensure_connected(sb)
-
-
 def reopen_renew_modal(sb) -> bool:
     """弹窗被意外关闭时重新打开"""
     sel, _ = find_renew_button(sb)
@@ -442,42 +401,6 @@ def reopen_renew_modal(sb) -> bool:
             sb.sleep(3)
             return True
         sb.sleep(1)
-    return False
-
-
-def click_turnstile_checkbox_direct(sb) -> bool:
-    """
-    切进 Turnstile iframe 直接点复选框。
-    背景：sb.uc_gui_click_captcha() 只认 .cf-turnstile-wrapper 包裹的标准结构，
-    续期弹窗里是裸 Turnstile（无 wrapper 包裹），它点不中且不报错。
-    注意：脚本触发的点击 Cloudflare 未必认，复选框也可能在 closed shadow DOM 里。
-    """
-    try:
-        sb.switch_to_frame(TURNSTILE_IFRAME_CSS, timeout=10)
-    except Exception as e:
-        print(f"⚠️ 切入 Turnstile iframe 失败: {e}")
-        return False
-    try:
-        clicked = sb.execute_script(r"""
-            const el = document.querySelector('label input[type="checkbox"]')
-                || document.querySelector('input[type="checkbox"]')
-                || document.querySelector('label')
-                || document.querySelector('[role="checkbox"]');
-            if (el) { el.click(); return true; }
-            return false;
-        """)
-    except Exception as e:
-        print(f"⚠️ iframe 内点击复选框异常: {e}")
-        clicked = False
-    finally:
-        try:
-            sb.switch_to_default_content()
-        except Exception:
-            pass
-    if clicked:
-        print("✅ 已在 Turnstile iframe 内点击复选框")
-        return True
-    print("⚠️ iframe 内未找到可点击的复选框元素")
     return False
 
 
@@ -1144,13 +1067,7 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         if wait_for_turnstile_pass(sb, timeout=8):
             passed = True
             break
-        # 方式1：按 iframe 实际坐标做系统级点击（弹窗内裸 Turnstile 最可靠）
-        if modal_state(sb).get("confirm") and click_turnstile_by_coords(sb):
-            if wait_for_turnstile_pass(sb, timeout=15):
-                passed = True
-                break
-        log_modal(sb, f"第{attempt}次坐标点击后")
-        # 方式2：seleniumbase GUI 点击（仅弹窗仍开着时）
+        # seleniumbase GUI 点击（仅弹窗仍开着时；点完必须 reconnect）
         if modal_state(sb).get("confirm"):
             try:
                 sb.uc_gui_click_captcha()
@@ -1162,13 +1079,6 @@ def do_renew(sb, current_expiry: str | None) -> bool:
                 passed = True
                 break
             log_modal(sb, f"第{attempt}次GUI点击后")
-        # 方式3：直接进 iframe 点复选框（兜底）
-        if modal_state(sb).get("confirm"):
-            click_turnstile_checkbox_direct(sb)
-            ensure_connected(sb)
-            if wait_for_turnstile_pass(sb, timeout=15):
-                passed = True
-                break
         print(f"⏳ 第 {attempt} 次未通过，重试...")
 
     ensure_connected(sb)
@@ -1352,14 +1262,29 @@ def build_sb_kwargs():
     return sb_kwargs, is_proxy, proxy_server
 
 
-def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server, seen_identities):
+def reset_browser(sb):
+    """多账号共用一个浏览器：切账号前清空所有 cookie 和站点存储，避免串号"""
+    ensure_connected(sb)
+    try:
+        sb.execute_cdp_cmd("Network.clearBrowserCookies", {})
+        sb.execute_cdp_cmd("Storage.clearDataForOrigin",
+                           {"origin": BASE, "storageTypes": "all"})
+    except Exception as e:
+        print(f"⚠️ 清理浏览器状态失败，改用 delete_all_cookies: {e}")
+        try:
+            sb.delete_all_cookies()
+        except Exception:
+            pass
+
+
+def run_account(sb, acct, idx, total, seen_identities):
     """
-    单个账号完整流程。每个账号用全新浏览器上下文（cookie 不串号）。
+    单个账号完整流程。浏览器多账号共用，进来先清空 cookie/存储（不串号）。
     返回 (ok: 是否成功, new_session_token: 刷新后的 token / 失败占位符 / None=保持原样,
            skipped: 是否因重复而跳过)。
     """
     global SESSION_TOKEN, DC_TOKEN, SERVER_URL
-    global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS, _LOGIN_METHOD, _FAILED, _EXIT_IP
+    global _START_TIME, _ACCOUNT, _APP_UPTIME, _SERVER_STATUS, _LOGIN_METHOD, _FAILED
     orig_session = acct["session_token"]
     SESSION_TOKEN = orig_session
     DC_TOKEN = acct["discord_token"]
@@ -1378,140 +1303,157 @@ def run_account(acct, idx, total, sb_kwargs, is_proxy, proxy_server, seen_identi
     cookies = {"session_token": SESSION_TOKEN, "login": "true", "theme": "system"}
     refreshed_token = None
 
-    with SB(**sb_kwargs) as sb:
-        try:
-            raw_ip = get_current_ip(proxy_server if is_proxy else "")
-            _EXIT_IP = f"{mask_ip(raw_ip)}（{'代理' if is_proxy else '直连'}）"
-            print(f"📍 当前出口 IP: {_EXIT_IP}")
-        except Exception as e:
-            _EXIT_IP = ""
-            print(f"⚠️ 获取出口 IP 失败: {e}")
+    reset_browser(sb)
 
-        login_ok = False
+    login_ok = False
 
-        # ---------- 方式1：SESSION_TOKEN ----------
-        # 占位符不是真 token，直接跳过，省一次页面加载
-        if not has_real_session and DC_TOKEN:
-            print("ℹ️ 该行无有效 cookie，直接走 Discord 登录")
-        if has_real_session:
-            print("🚀 启动浏览器并注入 Cookie...")
-            sb.open(f"{BASE}/")
-            sb.wait_for_ready_state_complete()
-            sb.sleep(1.5)
-            for name, value in cookies.items():
-                if value:
-                    sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
-            login_ok = goto_billings(sb)
-            print(f"📝 当前 URL: {clean_url(sb.get_current_url())}")
-            if login_ok:
-                print("✅ SESSION_TOKEN 登录成功")
-            else:
-                print("❌ SESSION_TOKEN 登录失败")
-                save_debug_screenshot(sb, "session_login_fail")
-
-        # ---------- 方式2：Discord OAuth ----------
-        if not login_ok and DC_TOKEN:
-            _LOGIN_METHOD = "Discord Token"
-            print("\n🔄 尝试 Discord OAuth 登录...")
-            if do_discord_login(sb):
-                login_ok = goto_billings(sb)
-                if login_ok:
-                    print("✅ Discord OAuth 登录成功")
-                else:
-                    print(f"❌ 登录后仍未到达账单页: {clean_url(sb.get_current_url())}")
-                    save_debug_screenshot(sb, "discord_billings_fail")
-            else:
-                print("❌ Discord OAuth 登录失败")
-
-        if not login_ok:
-            if not has_real_session:
-                error_msg = "Discord OAuth 登录失败"
-            elif not DC_TOKEN:
-                error_msg = "SESSION_TOKEN 失效且未配置 Discord Token"
-            else:
-                error_msg = "SESSION_TOKEN 和 Discord OAuth 均失败"
-            _FAILED = True
-            notify("❌ 登录失败", error=error_msg)
-            # 登录完全失败：原来是空行才写占位符（保证每行非空、位置不错位）；
-            # 原来有 token 的保持不动，避免网络抖动时覆盖有效 token
-            if not orig_session:
-                placeholder = FAILED_TOKEN_PREFIX + secrets.token_hex(4)
-                print(f"🔖 登录失败且该行无 token，写占位符: {placeholder}")
-                return False, placeholder, False
-            return False, None, False
-
-        # ---------- 到期日期 & 账号 ----------
+    # ---------- 方式1：SESSION_TOKEN ----------
+    # 占位符不是真 token，直接跳过，省一次页面加载
+    if not has_real_session and DC_TOKEN:
+        print("ℹ️ 该行无有效 cookie，直接走 Discord 登录")
+    if has_real_session:
+        print("🚀 启动浏览器并注入 Cookie...")
+        sb.open(f"{BASE}/")
+        sb.wait_for_ready_state_complete()
         sb.sleep(1.5)
-        page_source = sb.get_page_source()
-        current_expiry = extract_expiry_date(page_source)
-        print(f"📅 当前到期日期: {current_expiry}" if current_expiry else "⚠️ 未能提取当前到期日期")
-
-        _ACCOUNT, identity_ok = resolve_account(sb, page_source, body_text(sb), multi=total > 1)
-        if _ACCOUNT:
-            print(f"👤 登录账号: {mask_email(_ACCOUNT)}")
+        for name, value in cookies.items():
+            if value:
+                sb.add_cookie({"name": name, "value": value, "domain": "bot-hosting.net"})
+        login_ok = goto_billings(sb)
+        print(f"📝 当前 URL: {clean_url(sb.get_current_url())}")
+        if login_ok:
+            print("✅ SESSION_TOKEN 登录成功")
         else:
-            print("⚠️ 未能识别登录账号，通知里将显示「未配置」")
+            print("❌ SESSION_TOKEN 登录失败")
+            save_debug_screenshot(sb, "session_login_fail")
 
-        # ---------- 去重：同一 bot-hosting 账号本轮只处理一次 ----------
-        if _ACCOUNT and identity_ok:
-            if _ACCOUNT.lower() in seen_identities:
-                print(f"⚠️ 该账号本轮已处理过（{mask_email(_ACCOUNT)}），跳过避免重复操作")
-                notify("⏭️ 重复账号跳过", error=f"{mask_email(_ACCOUNT)} 本轮已处理过，跳过")
-                return True, None, True
-            seen_identities.add(_ACCOUNT.lower())
-
-        # ---------- 机器状态：运行中跳过，明确关机才开机 ----------
-        print("🔎 检测机器状态...")
-        try:
-            _SERVER_STATUS, _APP_UPTIME = check_and_manage_server(sb)
-        except Exception as e:
-            print(f"⚠️ 机器状态检测异常: {e}")
-            save_debug_screenshot(sb, "server_check_error")
-            _SERVER_STATUS, _APP_UPTIME = "unknown", ""
-
-        if _SERVER_STATUS == "running":
-            print(f"✅ 机器运行中，运行时长: {_APP_UPTIME or '未知'}")
-        elif _SERVER_STATUS == "started":
-            print(f"✅ 已执行开机，运行时长: {_APP_UPTIME or '启动中'}")
-        elif _SERVER_STATUS == "start_failed":
-            _FAILED = True
-            print("❌ 开机失败")
+    # ---------- 方式2：Discord OAuth ----------
+    if not login_ok and DC_TOKEN:
+        _LOGIN_METHOD = "Discord Token"
+        print("\n🔄 尝试 Discord OAuth 登录...")
+        if do_discord_login(sb):
+            login_ok = goto_billings(sb)
+            if login_ok:
+                print("✅ Discord OAuth 登录成功")
+            else:
+                print(f"❌ 登录后仍未到达账单页: {clean_url(sb.get_current_url())}")
+                save_debug_screenshot(sb, "discord_billings_fail")
         else:
-            print("⚠️ 未能确认机器状态")
+            print("❌ Discord OAuth 登录失败")
 
-        # ---------- 回账单页并续期 ----------
-        try:
-            sb.open(BILLINGS_URL)
-            sb.wait_for_ready_state_complete()
-            sb.sleep(1.5)
-        except Exception:
-            pass
-        try:
-            do_renew(sb, current_expiry)
-        except Exception as e:
-            _FAILED = True
-            print(f"❌ 续期流程异常: {e}")
-            traceback.print_exc()
-            save_debug_screenshot(sb, "renew_exception")
-            notify("❌ 续期失败", error=f"续期流程异常: {str(e)[:150]}")
-
-        # ---------- 收集刷新后的 SESSION_TOKEN（多账号跑完统一回写） ----------
-        print("🔄 检查 SESSION_TOKEN 是否需要更新")
-        new_token, token_expiry = get_cookie_info(sb, "session_token")
-        if should_update_cookie(new_token, acct.get("session_token", ""), token_expiry):
-            print(f"🔄 SESSION_TOKEN 需要更新（新值: {mask_token(new_token)}，跑完统一回写）")
-            refreshed_token = new_token
+    if not login_ok:
+        if not has_real_session:
+            error_msg = "Discord OAuth 登录失败"
+        elif not DC_TOKEN:
+            error_msg = "SESSION_TOKEN 失效且未配置 Discord Token"
         else:
-            print("✅ SESSION_TOKEN 无需更新")
+            error_msg = "SESSION_TOKEN 和 Discord OAuth 均失败"
+        _FAILED = True
+        notify("❌ 登录失败", error=error_msg)
+        # 登录完全失败：原来是空行才写占位符（保证每行非空、位置不错位）；
+        # 原来有 token 的保持不动，避免网络抖动时覆盖有效 token
+        if not orig_session:
+            placeholder = FAILED_TOKEN_PREFIX + secrets.token_hex(4)
+            print(f"🔖 登录失败且该行无 token，写占位符: {placeholder}")
+            return False, placeholder, False
+        return False, None, False
 
-        print("🏁 账号执行完毕")
+    # ---------- 到期日期 & 账号 ----------
+    sb.sleep(1.5)
+    page_source = sb.get_page_source()
+    current_expiry = extract_expiry_date(page_source)
+    print(f"📅 当前到期日期: {current_expiry}" if current_expiry else "⚠️ 未能提取当前到期日期")
+
+    _ACCOUNT, identity_ok = resolve_account(sb, page_source, body_text(sb), multi=total > 1)
+    if _ACCOUNT:
+        print(f"👤 登录账号: {mask_email(_ACCOUNT)}")
+    else:
+        print("⚠️ 未能识别登录账号，通知里将显示「未配置」")
+
+    # ---------- 去重：同一 bot-hosting 账号本轮只处理一次 ----------
+    if _ACCOUNT and identity_ok:
+        if _ACCOUNT.lower() in seen_identities:
+            print(f"⚠️ 该账号本轮已处理过（{mask_email(_ACCOUNT)}），跳过避免重复操作")
+            notify("⏭️ 重复账号跳过", error=f"{mask_email(_ACCOUNT)} 本轮已处理过，跳过")
+            return True, None, True
+        seen_identities.add(_ACCOUNT.lower())
+
+    # ---------- 机器状态：运行中跳过，明确关机才开机 ----------
+    print("🔎 检测机器状态...")
+    try:
+        _SERVER_STATUS, _APP_UPTIME = check_and_manage_server(sb)
+    except Exception as e:
+        print(f"⚠️ 机器状态检测异常: {e}")
+        save_debug_screenshot(sb, "server_check_error")
+        _SERVER_STATUS, _APP_UPTIME = "unknown", ""
+
+    if _SERVER_STATUS == "running":
+        print(f"✅ 机器运行中，运行时长: {_APP_UPTIME or '未知'}")
+    elif _SERVER_STATUS == "started":
+        print(f"✅ 已执行开机，运行时长: {_APP_UPTIME or '启动中'}")
+    elif _SERVER_STATUS == "start_failed":
+        _FAILED = True
+        print("❌ 开机失败")
+    else:
+        print("⚠️ 未能确认机器状态")
+
+    # ---------- 回账单页并续期 ----------
+    try:
+        sb.open(BILLINGS_URL)
+        sb.wait_for_ready_state_complete()
+        sb.sleep(1.5)
+    except Exception:
+        pass
+    try:
+        do_renew(sb, current_expiry)
+    except Exception as e:
+        _FAILED = True
+        print(f"❌ 续期流程异常: {e}")
+        traceback.print_exc()
+        save_debug_screenshot(sb, "renew_exception")
+        notify("❌ 续期失败", error=f"续期流程异常: {str(e)[:150]}")
+
+    # ---------- 收集刷新后的 SESSION_TOKEN（多账号跑完统一回写） ----------
+    print("🔄 检查 SESSION_TOKEN 是否需要更新")
+    new_token, token_expiry = get_cookie_info(sb, "session_token")
+    if should_update_cookie(new_token, acct.get("session_token", ""), token_expiry):
+        print(f"🔄 SESSION_TOKEN 需要更新（新值: {mask_token(new_token)}，跑完统一回写）")
+        refreshed_token = new_token
+    else:
+        print("✅ SESSION_TOKEN 无需更新")
+
+    print("🏁 账号执行完毕")
     return (not _FAILED), refreshed_token, False
+
+
+def _run_accounts(sb, accounts, seen_identities, summary) -> bool:
+    any_failed = False
+    for idx, acct in enumerate(accounts):
+        if not acct["session_token"] and not acct["discord_token"]:
+            print(f"\n⏭️ 第 {idx + 1} 行未配置，跳过")
+            continue
+        try:
+            ok, new_tok, skipped = run_account(sb, acct, idx, len(accounts), seen_identities)
+        except Exception as e:
+            print(f"❌ 账号 {idx + 1} 执行异常: {e}")
+            traceback.print_exc()
+            try:
+                notify("❌ 脚本异常", error=str(e)[:200])
+            except Exception:
+                pass
+            ok, new_tok, skipped = False, None, False
+        if new_tok:
+            acct["session_token"] = new_tok
+        acct["identity"] = _ACCOUNT
+        summary.append((acct, ok, skipped))
+        any_failed = any_failed or not ok
+    return any_failed
 
 
 def run():
     global _FAILED
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v4.2（多账号）")
+    print("   Bot-hosting 自动续期 v4.3（多账号，共用浏览器）")
     print("#" * 28)
 
     accounts = parse_accounts()
@@ -1523,26 +1465,16 @@ def run():
     seen_identities = set()  # 本轮已处理过的 bot-hosting 账号（防重复）
     any_failed = False
     summary = []
-    for idx, acct in enumerate(accounts):
-        if not acct["session_token"] and not acct["discord_token"]:
-            print(f"\n⏭️ 第 {idx + 1} 行未配置，跳过")
-            continue
-        try:
-            ok, new_tok, skipped = run_account(acct, idx, len(accounts),
-                                               sb_kwargs, is_proxy, proxy_server,
-                                               seen_identities)
-        except Exception as e:
-            print(f"❌ 账号 {idx + 1} 执行异常: {e}")
-            traceback.print_exc()
-            try:
-                notify("❌ 脚本异常", error=str(e)[:200])
-            except Exception:
-                pass
-            ok, new_tok, skipped = False, None, False
-        if new_tok:
-            acct["session_token"] = new_tok
-        summary.append((acct, ok, skipped))
-        any_failed = any_failed or not ok
+    global _EXIT_IP
+    try:
+        raw_ip = get_current_ip(proxy_server if is_proxy else "")
+        _EXIT_IP = f"{mask_ip(raw_ip)}（{'代理' if is_proxy else '直连'}）"
+        print(f"📍 当前出口 IP: {_EXIT_IP}")
+    except Exception as e:
+        _EXIT_IP = ""
+        print(f"⚠️ 获取出口 IP 失败: {e}")
+    with SB(**sb_kwargs) as sb:
+        any_failed = _run_accounts(sb, accounts, seen_identities, summary)
 
     # ---------- 统一回写 SESSION_TOKEN（按行拼接，一次写完） ----------
     new_tokens = [a["session_token"] for a in accounts]
@@ -1565,7 +1497,7 @@ def run():
             mark, word = "⏭️", "跳过（重复）"
         else:
             mark, word = ("✅", "成功") if ok else ("❌", "失败")
-        print(f"{mark} {acct['note'] or '账号'}: {word}")
+        print(f"{mark} {acct['note'] or mask_email(acct.get('identity', '')) or '账号'}: {word}")
     print("#" * 28)
 
     _FAILED = any_failed
