@@ -393,7 +393,15 @@ def click_turnstile_by_coords(sb) -> bool:
     """
     try:
         pos = sb.execute_script(r"""
-            const f = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            // iframe 常在 closed shadow DOM 里查不到，改找弹窗内约 300x65 的 widget 宿主元素
+            let f = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            if (!f) {
+                const root = document.querySelector('[role="dialog"], [aria-modal="true"]') || document.body;
+                const c = Array.from(root.querySelectorAll('div, span'))
+                    .filter(e => { const r = e.getBoundingClientRect();
+                        return r.width >= 280 && r.width <= 320 && r.height >= 55 && r.height <= 80; });
+                f = c[c.length - 1] || null;
+            }
             if (!f) return null;
             f.scrollIntoView({block: 'center'});
             const r = f.getBoundingClientRect();
@@ -414,6 +422,8 @@ def click_turnstile_by_coords(sb) -> bool:
     except Exception as e:
         print(f"⚠️ 按坐标点击 Turnstile 失败: {e}")
         return False
+    finally:
+        ensure_connected(sb)
 
 
 def reopen_renew_modal(sb) -> bool:
@@ -982,6 +992,20 @@ def find_renew_button(sb):
 CONFIRM_SEL = '[data-renew-confirm="1"]'
 
 
+def ensure_connected(sb):
+    """
+    uc_gui_click_captcha 内部会 driver.disconnect() 后做系统级点击，部分分支不 reconnect，
+    之后 sb.execute_script 走 CDP evaluate（顶层 return 报 Illegal return statement）、
+    sb.click 也会失效——这正是「验证已通过却找不到 Renew for 4 days」的根因（2026-10-21 定位）。
+    """
+    try:
+        if not sb.driver.is_connected():
+            sb.reconnect(0.5)
+            print("🔌 已重新连接 WebDriver")
+    except Exception as e:
+        print(f"⚠️ 重新连接 WebDriver 失败: {e}")
+
+
 def modal_state(sb) -> dict:
     """
     续期弹窗状态（不依赖固定文案）：
@@ -1008,6 +1032,13 @@ def modal_state(sb) -> dict:
             };
         """) or {}
     except Exception as e:
+        if not getattr(sb, "_ms_retry", False):
+            sb._ms_retry = True
+            try:
+                ensure_connected(sb)
+                return modal_state(sb)
+            finally:
+                sb._ms_retry = False
         return {"error": str(e)[:100]}
 
 
@@ -1126,6 +1157,7 @@ def do_renew(sb, current_expiry: str | None) -> bool:
                 print(f"🖱️ 第 {attempt} 次 GUI 点击 Turnstile")
             except Exception as e:
                 print(f"⚠️ 第 {attempt} 次 GUI 点击 Turnstile 出错: {e}")
+            ensure_connected(sb)
             if wait_for_turnstile_pass(sb, timeout=10):
                 passed = True
                 break
@@ -1133,11 +1165,13 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         # 方式3：直接进 iframe 点复选框（兜底）
         if modal_state(sb).get("confirm"):
             click_turnstile_checkbox_direct(sb)
+            ensure_connected(sb)
             if wait_for_turnstile_pass(sb, timeout=15):
                 passed = True
                 break
         print(f"⏳ 第 {attempt} 次未通过，重试...")
 
+    ensure_connected(sb)
     if not passed:
         done = renewed_already(sb, current_expiry)
         if done:
