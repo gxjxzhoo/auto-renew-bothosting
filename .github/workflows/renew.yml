@@ -15,11 +15,11 @@ jobs:
 
     steps:
       - name: 📥 Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false  # 不把 GITHUB_TOKEN 留在 .git/config 里
       - name: 加载共享变量（env-config）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         continue-on-error: true
         with:
           repository: gxjxzhoo/env-config
@@ -53,7 +53,7 @@ jobs:
           node-link: ${{ env.NODE_LINK || secrets.NODE_LINK }}
 
       - name: 🐍 Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: 'pip'  # 缓存 pip 下载，多次运行不用重新下载依赖
@@ -97,7 +97,7 @@ jobs:
 
       - name: 📸 上传调试截图（仅私有仓库，公开仓库的截图任何人都能下载）
         if: always() && github.event.repository.private
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: debug-screenshots
           path: |
