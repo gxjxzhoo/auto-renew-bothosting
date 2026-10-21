@@ -1436,8 +1436,8 @@ def _close_browser(stack):
 
 def _run_accounts(sb_kwargs, accounts, seen_identities, summary) -> bool:
     """
-    折中方案：多账号默认复用同一个浏览器（省启动时间），
-    某个账号失败或抛异常后关掉它，下一个账号换全新浏览器，避免连锁失败。
+    一个账号一个浏览器：每个账号跑完即关闭，下一个账号用全新浏览器，
+    互不影响（某个账号崩溃/断连不会连累后面的账号）。
     """
     any_failed = False
     stack, sb = None, None
@@ -1459,8 +1459,7 @@ def _run_accounts(sb_kwargs, accounts, seen_identities, summary) -> bool:
                     notify("❌ 脚本异常", error=str(e)[:200])
                 except Exception:
                     pass
-            if not ok and stack is not None:
-                print("♻️ 本账号失败，关闭浏览器，下一个账号使用全新浏览器")
+            if stack is not None:
                 _close_browser(stack)
                 stack, sb = None, None
             if new_tok:
@@ -1477,7 +1476,7 @@ def _run_accounts(sb_kwargs, accounts, seen_identities, summary) -> bool:
 def run():
     global _FAILED
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v4.4（多账号，复用浏览器，失败后换新）")
+    print("   Bot-hosting 自动续期 v4.5（多账号，一个账号一个浏览器）")
     print("#" * 28)
 
     accounts = parse_accounts()
