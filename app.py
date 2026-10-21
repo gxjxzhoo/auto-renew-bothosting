@@ -17,6 +17,7 @@ Bot-hosting 自动续期
 """
 
 import os
+from contextlib import ExitStack
 import re
 import secrets
 import sys
@@ -1426,34 +1427,57 @@ def run_account(sb, acct, idx, total, seen_identities):
     return (not _FAILED), refreshed_token, False
 
 
-def _run_accounts(sb, accounts, seen_identities, summary) -> bool:
+def _close_browser(stack):
+    try:
+        stack.close()
+    except Exception as e:
+        print(f"⚠️ 关闭浏览器出错（忽略）: {e}")
+
+
+def _run_accounts(sb_kwargs, accounts, seen_identities, summary) -> bool:
+    """
+    折中方案：多账号默认复用同一个浏览器（省启动时间），
+    某个账号失败或抛异常后关掉它，下一个账号换全新浏览器，避免连锁失败。
+    """
     any_failed = False
-    for idx, acct in enumerate(accounts):
-        if not acct["session_token"] and not acct["discord_token"]:
-            print(f"\n⏭️ 第 {idx + 1} 行未配置，跳过")
-            continue
-        try:
-            ok, new_tok, skipped = run_account(sb, acct, idx, len(accounts), seen_identities)
-        except Exception as e:
-            print(f"❌ 账号 {idx + 1} 执行异常: {e}")
-            traceback.print_exc()
-            try:
-                notify("❌ 脚本异常", error=str(e)[:200])
-            except Exception:
-                pass
+    stack, sb = None, None
+    try:
+        for idx, acct in enumerate(accounts):
+            if not acct["session_token"] and not acct["discord_token"]:
+                print(f"\n⏭️ 第 {idx + 1} 行未配置，跳过")
+                continue
             ok, new_tok, skipped = False, None, False
-        if new_tok:
-            acct["session_token"] = new_tok
-        acct["identity"] = _ACCOUNT
-        summary.append((acct, ok, skipped))
-        any_failed = any_failed or not ok
+            try:
+                if sb is None:
+                    stack = ExitStack()
+                    sb = stack.enter_context(SB(**sb_kwargs))
+                ok, new_tok, skipped = run_account(sb, acct, idx, len(accounts), seen_identities)
+            except Exception as e:
+                print(f"❌ 账号 {idx + 1} 执行异常: {e}")
+                traceback.print_exc()
+                try:
+                    notify("❌ 脚本异常", error=str(e)[:200])
+                except Exception:
+                    pass
+            if not ok and stack is not None:
+                print("♻️ 本账号失败，关闭浏览器，下一个账号使用全新浏览器")
+                _close_browser(stack)
+                stack, sb = None, None
+            if new_tok:
+                acct["session_token"] = new_tok
+            acct["identity"] = _ACCOUNT
+            summary.append((acct, ok, skipped))
+            any_failed = any_failed or not ok
+    finally:
+        if stack is not None:
+            _close_browser(stack)
     return any_failed
 
 
 def run():
     global _FAILED
     print("#" * 28)
-    print("   Bot-hosting 自动续期 v4.3（多账号，共用浏览器）")
+    print("   Bot-hosting 自动续期 v4.4（多账号，复用浏览器，失败后换新）")
     print("#" * 28)
 
     accounts = parse_accounts()
@@ -1473,8 +1497,7 @@ def run():
     except Exception as e:
         _EXIT_IP = ""
         print(f"⚠️ 获取出口 IP 失败: {e}")
-    with SB(**sb_kwargs) as sb:
-        any_failed = _run_accounts(sb, accounts, seen_identities, summary)
+    any_failed = _run_accounts(sb_kwargs, accounts, seen_identities, summary)
 
     # ---------- 统一回写 SESSION_TOKEN（按行拼接，一次写完） ----------
     new_tokens = [a["session_token"] for a in accounts]
