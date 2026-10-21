@@ -1416,7 +1416,15 @@ def run_account(sb, acct, idx, total, seen_identities):
 
     # ---------- 收集刷新后的 SESSION_TOKEN（多账号跑完统一回写） ----------
     print("🔄 检查 SESSION_TOKEN 是否需要更新")
-    new_token, token_expiry = get_cookie_info(sb, "session_token")
+    try:
+        ensure_connected(sb)
+        new_token, token_expiry = get_cookie_info(sb, "session_token")
+    except Exception as e:
+        print(f"⚠️ 读取 cookie 失败，保留原 token: {e}")
+        new_token, token_expiry = None, None
+    if new_token and not new_token.startswith("eyJ"):
+        print("⚠️ 读到的 session_token 不像有效 JWT，保留原 token")
+        new_token = None
     if should_update_cookie(new_token, acct.get("session_token", ""), token_expiry):
         print(f"🔄 SESSION_TOKEN 需要更新（新值: {mask_token(new_token)}，跑完统一回写）")
         refreshed_token = new_token
