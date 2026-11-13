@@ -9,7 +9,7 @@ Bot-hosting 自动续期
 环境变量：
   SESSION_TOKEN / DISCORD_TOKEN   登录凭据（至少一个）
   EMAIL         可选，仅单账号时用于通知显示；多账号时忽略，自动从设置页读取
-  SERVER_URL    可选，服务详情页（/a/d/<uuid>）；多账号时一行一个按行号配对；未设置则自动发现
+  SERVER_URL    可选，服务详情页（/dash/deployments/<uuid>）；多账号时一行一个按行号配对；未设置则自动发现
   GH_TOKEN      可选，用于自动更新 SESSION_TOKEN Secret
   TG_BOT_TOKEN / TG_CHAT_ID       Telegram 通知
   IS_PROXY / PROXY_SERVER / HEADLESS
@@ -87,8 +87,8 @@ if not SESSION_TOKEN and not DISCORD_TOKEN:
     sys.exit(1)
 
 BASE = "https://bot-hosting.net"
-BILLINGS_URL = f"{BASE}/a/billings"
-# 可选：直接指定服务页，例如 https://bot-hosting.net/a/d/<uuid>（只填 /a/d/<uuid> 也可）
+BILLINGS_URL = f"{BASE}/dash/billings"
+# 可选：直接指定服务页，例如 https://bot-hosting.net/dash/deployments/<uuid>（只填 /dash/deployments/<uuid> 也可）
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 SERVER_URL_LINES = [u.strip() for u in (os.environ.get("SERVER_URL") or "").splitlines()]
 SERVER_URL = ""  # 当前账号的服务页，在 run_account 里按行号设置
@@ -97,8 +97,8 @@ SERVER_URL = ""  # 当前账号的服务页，在 run_account 里按行号设置
 def normalize_server_url(u: str) -> str:
     u = (u or "").strip()
     return BASE + u if u.startswith("/") else u
-# 服务详情页路径特征：/a/d/<uuid>
-SERVER_PATH_RE = re.compile(r"^/a/d/[0-9a-fA-F\-]{8,}")
+# 服务详情页路径特征：/dash/deployments/<uuid>（2026-11-11 前为 /a/d/<uuid>，站点 308 迁移）
+SERVER_PATH_RE = re.compile(r"^/dash/deployments/[0-9a-fA-F\-]{8,}")
 
 _LOGIN_METHOD = "SESSION_TOKEN"
 DC_TOKEN = ""
@@ -609,8 +609,8 @@ def list_page_links(sb) -> list[dict]:
 
 
 def find_server_link(sb) -> str | None:
-    """在主内容区找服务详情链接；优先 /a/d/<uuid>，其次带状态文字的卡片"""
-    # 0) 已知的服务页路径特征 /a/d/<uuid>
+    """在主内容区找服务详情链接；优先 /dash/deployments/<uuid>，其次带状态文字的卡片"""
+    # 0) 已知的服务页路径特征 /dash/deployments/<uuid>
     for link in list_page_links(sb):
         if SERVER_PATH_RE.match(link["href"]):
             return link["href"].split("?")[0]
@@ -631,12 +631,12 @@ def find_server_link(sb) -> str | None:
     if href:
         return href
 
-    # 2) 主内容区里路径不在黑名单的 /a/... 链接
+    # 2) 主内容区里路径不在黑名单的 /dash/... 链接
     for link in list_page_links(sb):
         if link["chrome"]:
             continue
         segs = [s for s in link["href"].split("?")[0].split("/") if s]
-        if not segs or segs[0] != "a" or len(segs) < 2:
+        if not segs or segs[0] != "dash" or len(segs) < 2:
             continue
         if segs[1].lower() in NON_SERVER_SEGMENTS:
             continue
@@ -690,24 +690,24 @@ def check_and_manage_server(sb) -> tuple[str, str]:
     - stopped  → 进入详情页后点 Start
     - unknown  → 尝试进详情页再判断；仍未知则不操作
     关键：
-    1. 总览页即使显示 OFFLINE/Stopped，也必须先进入 /a/d/<uuid>，
+    1. 总览页即使显示 OFFLINE/Stopped，也必须先进入 /dash/deployments/<uuid>，
        详情页才有 Start 按钮，总览页点不到。
     2. 总览页卡片的时长不可靠（2026-10-16 实测：总览页读 31天19小时，
        服务页读 26天10小时且与真实流逝一致），所以只要没指定 SERVER_URL，
        一律进服务页拿状态和时长，不再信任总览页的 running 早退。
     """
-    start_url = SERVER_URL or f"{BASE}/a/"
+    start_url = SERVER_URL or f"{BASE}/dash/"
     sb.open(start_url)
     sb.wait_for_ready_state_complete()
     st, up, text = read_state(sb)
     on_detail = is_detail_page(sb)
     print(f"📊 {'服务页' if on_detail or SERVER_URL else '总览页'}状态: {st}, 时长: {up or '无'}")
 
-    # 不在详情页时，一律先找 /a/d/<uuid> 进入（无论 running / stopped / unknown）
+    # 不在详情页时，一律先找 /dash/deployments/<uuid> 进入（无论 running / stopped / unknown）
     if not on_detail and not SERVER_URL:
         href = find_server_link(sb)
         if not href:
-            print("⚠️ 未找到服务器链接 (/a/d/...)")
+            print("⚠️ 未找到服务器链接 (/dash/deployments/...)")
             dump_debug(sb, "no_server_link")
             # 退回总览页的判断（有总比没有好）
             if st == "running" or up:
@@ -1168,7 +1168,7 @@ def do_renew(sb, current_expiry: str | None) -> bool:
 
 
 # ==================== 登录账号识别 ====================
-SETTINGS_URL = f"{BASE}/a/settings"
+SETTINGS_URL = f"{BASE}/dash/settings"
 
 
 def read_account_from_settings(sb) -> str:
@@ -1246,7 +1246,7 @@ def goto_billings(sb) -> bool:
     sb.wait_for_ready_state_complete()
     sb.sleep(2)
     url = sb.get_current_url()
-    return "/a/billings" in url and "/login" not in url and "error=" not in url
+    return ("/dash/billings" in url or "/a/billings" in url) and "/login" not in url and "error=" not in url
 
 
 def build_sb_kwargs():
