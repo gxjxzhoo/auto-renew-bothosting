@@ -961,7 +961,15 @@ def modal_state(sb) -> dict:
             const btns = Array.from(document.querySelectorAll('button, [role="button"], a'))
                 .filter(e => e.offsetParent !== null
                     && /Renew\s+for\s+\d+\s*days?/i.test(e.innerText || ''));
-            const b = btns[0] || null;
+            // 页面上可能有多个「Renew for N days」（弹窗背后还有一个被遮罩挡住的），
+            // 优先选未被遮挡的（点到的就是它自己），其次选弹窗内的
+            const onTop = e => {
+                const r = e.getBoundingClientRect();
+                const t = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+                return !!t && (t === e || e.contains(t));
+            };
+            const inDlg = e => !!e.closest('[role="dialog"], [aria-modal="true"], dialog, .modal, [class*="modal"], [class*="Modal"]');
+            const b = btns.find(onTop) || btns.find(inDlg) || btns[btns.length - 1] || null;
             if (b) b.setAttribute('data-renew-confirm', '1');
             const dlg = document.querySelector('[role="dialog"], [aria-modal="true"], .modal, [class*="modal"], [class*="Modal"]');
             const body = (document.body.innerText || '');
