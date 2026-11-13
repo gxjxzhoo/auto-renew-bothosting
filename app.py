@@ -1039,6 +1039,58 @@ def flush_notifications():
     _TG_BLOCKS.clear()
 
 
+def install_net_hook(sb):
+    """记录页面 fetch/XHR 请求与响应（用于定位点击续期后服务端返回了什么）"""
+    try:
+        sb.execute_script(r"""
+            if (window.__netHooked) return;
+            window.__netHooked = true; window.__netLog = [];
+            const push = (o) => { try { window.__netLog.push(o); } catch (e) {} };
+            const of = window.fetch;
+            window.fetch = async function(input, init) {
+                const url = (typeof input === 'string') ? input : (input && input.url) || '';
+                const method = (init && init.method) || (input && input.method) || 'GET';
+                try {
+                    const r = await of.apply(this, arguments);
+                    try { r.clone().text().then(t => push({m: method, u: url, s: r.status, b: (t || '').slice(0, 300)})); } catch (e) {}
+                    return r;
+                } catch (e) { push({m: method, u: url, s: 'ERR', b: String(e).slice(0, 200)}); throw e; }
+            };
+            const oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(m, u) { this.__m = m; this.__u = u; return oo.apply(this, arguments); };
+            XMLHttpRequest.prototype.send = function() {
+                this.addEventListener('loadend', () => push({m: this.__m, u: this.__u, s: this.status, b: String(this.responseText || '').slice(0, 300)}));
+                return os.apply(this, arguments);
+            };
+        """)
+    except Exception as e:
+        print(f"⚠️ 安装网络记录失败: {str(e)[:100]}")
+
+
+def dump_net_log(sb):
+    try:
+        log = sb.execute_script("const l = window.__netLog || []; window.__netLog = []; return l;") or []
+    except Exception:
+        return
+    for r in log:
+        u = str(r.get("u", ""))
+        if "cloudflare" in u or "/cdn-cgi/" in u:
+            continue
+        if str(r.get("m", "GET")).upper() == "GET" and r.get("s") == 200:
+            continue
+        print(f"🌐 {r.get('m')} {clean_url(u if u.startswith('http') else BASE + u)} -> {r.get('s')} {redact(str(r.get('b', '')))[:200]!r}")
+
+
+def modal_full_text(sb) -> str:
+    try:
+        return sb.execute_script(r"""
+            const dlg = document.querySelector('[role="dialog"], [aria-modal="true"], .modal, [class*="modal"], [class*="Modal"]');
+            return dlg ? (dlg.innerText || '').trim().replace(/\s+/g, ' ') : '';
+        """) or ""
+    except Exception:
+        return ""
+
+
 def do_renew(sb, current_expiry: str | None) -> bool:
     global _FAILED
     expiry_text = current_expiry or "（未获取到）"
@@ -1132,16 +1184,42 @@ def do_renew(sb, current_expiry: str | None) -> bool:
                    expiry_date=exp or "（未获取到）")
             return True
     print(f"⏳ 点击「{st.get('confirm') or 'Renew for N days'}」...")
-    try:
-        if not st.get("confirm"):
-            raise RuntimeError("验证通过后 20s 内未找到可点击的确认续期按钮")
+    if not st.get("confirm"):
+        print("❌ 点击续期按钮失败: 验证通过后 20s 内未找到可点击的确认续期按钮")
+        _FAILED = True
+        save_debug_screenshot(sb, "renew_confirm_fail")
+        notify("❌ 续期失败", error="点击最终续期按钮失败")
+        return False
+    install_net_hook(sb)
+    clicked = False
+    # 依次尝试：WebDriver 点击 → UC 点击 → 系统级鼠标点击；每次后看弹窗是否关闭/出现成功提示
+    for how in ("click", "uc_click", "gui_click"):
+        if not modal_state(sb).get("confirm"):
+            break
         try:
-            sb.click(CONFIRM_SEL, timeout=5)
-        except Exception:
-            sb.js_click(CONFIRM_SEL)
-        print("✅ 已点击续期按钮")
-    except Exception as e:
-        print(f"❌ 点击续期按钮失败: {e}")
+            if how == "click":
+                sb.click(CONFIRM_SEL, timeout=5)
+            elif how == "uc_click":
+                sb.uc_click(CONFIRM_SEL)
+            else:
+                sb.gui_click_element(CONFIRM_SEL)
+            ensure_connected(sb)
+            clicked = True
+            print(f"✅ 已点击续期按钮（{how}）")
+        except Exception as e:
+            ensure_connected(sb)
+            print(f"⚠️ {how} 点击失败: {str(e)[:120]}")
+            continue
+        end = time.time() + 8
+        while time.time() < end:
+            sb.sleep(1)
+            if not modal_state(sb).get("confirm") or RENEWED_RE.search(sb.get_page_source()):
+                break
+        dump_net_log(sb)
+        if not modal_state(sb).get("confirm") or RENEWED_RE.search(sb.get_page_source()):
+            break
+        print(f"🔍 {how} 后弹窗仍在: {redact(modal_full_text(sb))[-400:]!r}")
+    if not clicked:
         _FAILED = True
         save_debug_screenshot(sb, "renew_confirm_fail")
         notify("❌ 续期失败", error="点击最终续期按钮失败")
