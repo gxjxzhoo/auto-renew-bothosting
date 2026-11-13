@@ -1039,12 +1039,57 @@ def flush_notifications():
     _TG_BLOCKS.clear()
 
 
+def confirm_diag(sb) -> str:
+    """确认按钮诊断：顶层元素是否被遮挡、按钮 HTML、React onClick、表单、Turnstile token、控制台错误"""
+    try:
+        return sb.execute_script(r"""
+            const b = document.querySelector('[data-renew-confirm="1"]');
+            if (!b) return 'no-button';
+            const r = b.getBoundingClientRect();
+            const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+            const pk = Object.keys(b).find(k => k.startsWith('__reactProps'));
+            const props = pk ? Object.keys(b[pk] || {}).join(',') : 'none';
+            const tok = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"]')).map(i => (i.value || '').length);
+            let tsr = null; try { tsr = window.turnstile && window.turnstile.getResponse ? (window.turnstile.getResponse() || '').length : 'no-api'; } catch (e) { tsr = 'err:' + e; }
+            return JSON.stringify({
+                html: b.outerHTML.slice(0, 300),
+                rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+                covered: top && top !== b && !b.contains(top) ? (top.tagName + '.' + (top.className || '').toString().slice(0, 60)) : false,
+                react: props, form: !!b.closest('form'), tokens: tok, tsr: tsr,
+                errs: (window.__errLog || []).slice(-5)
+            });
+        """) or ""
+    except Exception as e:
+        return f"diag-error: {str(e)[:100]}"
+
+
+def react_click(sb) -> bool:
+    """直接调用 React 的 onClick（绕过遮挡层/事件拦截）"""
+    try:
+        return bool(sb.execute_script(r"""
+            const b = document.querySelector('[data-renew-confirm="1"]');
+            if (!b) return false;
+            const pk = Object.keys(b).find(k => k.startsWith('__reactProps'));
+            const h = pk && b[pk] && b[pk].onClick;
+            if (h) { h({preventDefault(){}, stopPropagation(){}, currentTarget: b, target: b, nativeEvent: new MouseEvent('click')}); return true; }
+            const f = b.closest('form');
+            if (f) { f.requestSubmit ? f.requestSubmit(b) : f.submit(); return true; }
+            return false;
+        """))
+    except Exception as e:
+        print(f"⚠️ react_click 出错: {str(e)[:100]}")
+        return False
+
+
 def install_net_hook(sb):
     """记录页面 fetch/XHR 请求与响应（用于定位点击续期后服务端返回了什么）"""
     try:
         sb.execute_script(r"""
             if (window.__netHooked) return;
-            window.__netHooked = true; window.__netLog = [];
+            window.__netHooked = true; window.__netLog = []; window.__errLog = [];
+            window.addEventListener('error', e => window.__errLog.push(String(e.message).slice(0, 150)));
+            window.addEventListener('unhandledrejection', e => window.__errLog.push('rej:' + String(e.reason).slice(0, 150)));
+            const ce = console.error; console.error = function() { try { window.__errLog.push('ce:' + Array.from(arguments).map(String).join(' ').slice(0, 150)); } catch (e) {} return ce.apply(this, arguments); };
             const push = (o) => { try { window.__netLog.push(o); } catch (e) {} };
             const of = window.fetch;
             window.fetch = async function(input, init) {
@@ -1191,14 +1236,19 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         notify("❌ 续期失败", error="点击最终续期按钮失败")
         return False
     install_net_hook(sb)
+    print(f"🔍 确认按钮诊断: {redact(confirm_diag(sb))}")
     clicked = False
     # 依次尝试：WebDriver 点击 → UC 点击 → 系统级鼠标点击；每次后看弹窗是否关闭/出现成功提示
-    for how in ("click", "uc_click", "gui_click"):
+    for how in ("click", "react", "uc_click", "gui_click"):
         if not modal_state(sb).get("confirm"):
             break
         try:
             if how == "click":
                 sb.click(CONFIRM_SEL, timeout=5)
+            elif how == "react":
+                if not react_click(sb):
+                    print("⚠️ 未找到 React onClick/表单，跳过")
+                    continue
             elif how == "uc_click":
                 sb.uc_click(CONFIRM_SEL)
             else:
@@ -1218,7 +1268,7 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         dump_net_log(sb)
         if not modal_state(sb).get("confirm") or RENEWED_RE.search(sb.get_page_source()):
             break
-        print(f"🔍 {how} 后弹窗仍在: {redact(modal_full_text(sb))[-400:]!r}")
+        print(f"🔍 {how} 后弹窗仍在；诊断: {redact(confirm_diag(sb))}")
     if not clicked:
         _FAILED = True
         save_debug_screenshot(sb, "renew_confirm_fail")
