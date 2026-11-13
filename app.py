@@ -435,34 +435,39 @@ def format_countdown(countdown_str: str) -> str:
 
 
 # ==================== 页面信息提取 ====================
-_MONTHS = {m: i + 1 for i, m in enumerate(
-    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+_MON = r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?"
 
 
 def extract_expiry_date(page_source: str) -> str | None:
-    # 新版 /dash 页面日期格式：「Expires on 14 Nov 2026」（2026-11 起）
-    m = re.search(r"[Ee]xpir\w*\s*(?:on\s+|:\s*|-\s*)?(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})", page_source)
-    if m and m.group(2).lower()[:3] in _MONTHS:
-        return f"{m.group(3)}/{_MONTHS[m.group(2).lower()[:3]]:02d}/{int(m.group(1)):02d}"
-    m = re.search(r"[Ee]xpir\w*\s*(?:on\s+|:\s*|-\s*)?(\d{4})-(\d{2})-(\d{2})", page_source)
-    if m:
-        return f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+    """返回 YYYY/MM/DD。兼容旧版「Expires: 2026/11/14」和新版「expires on 14 Nov 2026」"""
+    text = re.sub(r"<[^>]+>", " ", page_source or "")
+    text = re.sub(r"\s+", " ", text)
     patterns = [
         r"[Ee]xpires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})",
         r"[Ee]xpires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
         r"(\d{4}/\d{2}/\d{2})\s*[\-–]\s*renew",
         r"(\d{2}/\d{2}/\d{4})\s*[\-–]\s*renew",
     ]
-    for pattern in patterns:
-        match = re.search(pattern, page_source)
-        if match:
-            parts = match.group(1).split("/")
-            if len(parts) == 3 and len(parts[0]) == 2 and len(parts[2]) == 4:
-                a, b, y = int(parts[0]), int(parts[1]), parts[2]
-                # 默认 MM/DD/YYYY；首段 > 12 说明是 DD/MM/YYYY
-                mm, dd = (b, a) if a > 12 else (a, b)
-                return f"{y}/{mm:02d}/{dd:02d}"
-            return match.group(1)
+    for src in (page_source or "", text):
+        for pattern in patterns:
+            match = re.search(pattern, src)
+            if match:
+                parts = match.group(1).split("/")
+                if len(parts) == 3 and len(parts[0]) == 2 and len(parts[2]) == 4:
+                    a, b, y = int(parts[0]), int(parts[1]), parts[2]
+                    # 默认 MM/DD/YYYY；首段 > 12 说明是 DD/MM/YYYY
+                    mm, dd = (b, a) if a > 12 else (a, b)
+                    return f"{y}/{mm:02d}/{dd:02d}"
+                return match.group(1)
+    # 新版文案（2026-11 改版）：expires on 14 Nov 2026 / Expires Nov 14, 2026
+    m = re.search(r"[Ee]xpires?\s*(?:on|:)?\s*(\d{1,2})\s+" + _MON + r",?\s+(\d{4})", text)
+    if m:
+        return f"{m.group(3)}/{_MONTHS[m.group(2).lower()]:02d}/{int(m.group(1)):02d}"
+    m = re.search(r"[Ee]xpires?\s*(?:on|:)?\s*" + _MON + r"\s+(\d{1,2}),?\s+(\d{4})", text)
+    if m:
+        return f"{m.group(3)}/{_MONTHS[m.group(1).lower()]:02d}/{int(m.group(2)):02d}"
     return None
 
 
@@ -876,7 +881,8 @@ def do_discord_login(sb) -> bool:
 # ==================== 续期核心 ====================
 # 倒计时文案有两种："Renew in HH:MM:SS"（续期成功后）和
 # "Renewal cooldown HH:MM:SS"（续期后冷却中，按钮不可点，2026-10-16 实测）
-COUNTDOWN_RE = re.compile(r"(?:Renew in|Renewal cooldown|Renew again in|Available in)\s+(\d{2}:\d{2}:\d{2})")
+RENEWED_RE = re.compile(r"Renewed\s+(?:for\s+\d+\s*days?|successfully)|successfully\s+renewed", re.I)
+COUNTDOWN_RE = re.compile(r"(?:Renew in|Renewal cooldown)\s+(\d{2}:\d{2}:\d{2})")
 
 
 def find_renew_button(sb):
@@ -1001,7 +1007,7 @@ def renewed_already(sb, current_expiry: str | None):
     page = sb.get_page_source()
     m = COUNTDOWN_RE.search(page)
     exp = extract_expiry_date(page)
-    toast = re.search(r"Renewed for \d+ days?", page)  # 成功提示「Renewed for 4 days.」（2026-10-21 手动实测）
+    toast = RENEWED_RE.search(page)  # 成功提示「Renewed for 4 days.」（2026-10-21 手动实测）
     if m or toast or (exp and current_expiry and exp != current_expiry):
         return (m.group(1) if m else None), exp
     return None
@@ -1059,6 +1065,12 @@ def do_renew(sb, current_expiry: str | None) -> bool:
             log_modal(sb, "点击外部按钮后")
             raise RuntimeError("20s 内未出现「Renew for N days」按钮")
         log_modal(sb, "弹窗打开")
+        if not current_expiry:
+            # 新版账单页不直接显示到期日，弹窗里有「currently expires on 14 Nov 2026」
+            current_expiry = extract_expiry_date(sb.get_page_source())
+            if current_expiry:
+                expiry_text = current_expiry
+                print(f"📅 弹窗显示当前到期日期: {current_expiry}")
     except Exception as e:
         print(f"❌ 点击外部按钮或等待模态框失败: {e}")
         _FAILED = True
@@ -1138,29 +1150,19 @@ def do_renew(sb, current_expiry: str | None) -> bool:
     # 点击后轮询最多 30 秒：出现新倒计时，或到期日变化即判成功。
     # 不再因「弹窗关闭」提前退出——此时页面上的倒计时/到期日可能还没刷新。
     deadline = time.time() + 30
-    poll_start = time.time()
-    refreshed = False
-    new_expiry, new_match, modal_open = None, None, True
+    new_expiry, new_match, modal_open, toast_seen = None, None, True, False
     while time.time() < deadline:
         new_page = sb.get_page_source()
+        if RENEWED_RE.search(new_page):
+            toast_seen = True
         new_expiry = extract_expiry_date(new_page)
         new_match = COUNTDOWN_RE.search(new_page)
         try:
             modal_open = bool(modal_state(sb).get("confirm"))
         except Exception:
             modal_open = True
-        if new_match or (new_expiry and new_expiry != current_expiry):
+        if new_match or toast_seen or (new_expiry and current_expiry and new_expiry > current_expiry):
             break
-        # 新版页面点完确认后可能不原地刷新：弹窗已关且 10 秒无信号时整页刷新一次再看
-        if not modal_open and not refreshed and time.time() - poll_start > 10:
-            refreshed = True
-            try:
-                sb.refresh()
-                sb.wait_for_ready_state_complete()
-                sb.sleep(2)
-            except Exception:
-                pass
-            continue
         sb.sleep(3)
 
     if new_match:
@@ -1170,9 +1172,14 @@ def do_renew(sb, current_expiry: str | None) -> bool:
                expiry_date=new_expiry or "（未获取到）")
         return True
 
-    if new_expiry and new_expiry != current_expiry:
+    if new_expiry and current_expiry and new_expiry > current_expiry:
         print(f"✅ 续期成功，到期日期更新为: {new_expiry}")
         notify("✅ 续期成功", extra="到期日期已更新", expiry_date=new_expiry)
+        return True
+
+    if toast_seen:
+        print("✅ 续期成功（页面提示 Renewed）")
+        notify("✅ 续期成功", extra="页面提示已续期", expiry_date=new_expiry or expiry_text)
         return True
 
     # 弹窗还开着且 bot check 仍未通过 → 按钮是锁定的，之前那次点击根本没生效
@@ -1182,6 +1189,31 @@ def do_renew(sb, current_expiry: str | None) -> bool:
         save_debug_screenshot(sb, "renew_locked")
         notify("❌ 续期失败", error="Turnstile 未通过，续期按钮被锁定", expiry_date=expiry_text)
         return False
+
+    # 页面没自动刷新：重新打开账单页，以外部按钮状态为准
+    log_modal(sb, "点击后30s")
+    print(f"🔍 点击后页面文本: {redact(body_text(sb))[:400]!r}")
+    print("🔁 重新打开账单页核实续期结果...")
+    try:
+        sb.open(BILLINGS_URL)
+        sb.wait_for_ready_state_complete()
+        sb.sleep(3)
+        ensure_connected(sb)
+        page = sb.get_page_source()
+        exp2 = extract_expiry_date(page)
+        sel2, cd2 = find_renew_button(sb)
+        if cd2:
+            print(f"✅ 续期成功！刷新后倒计时: {cd2}")
+            notify("✅ 续期成功", extra=f"⏱️ 可续期时间: {format_countdown(cd2)}后",
+                   expiry_date=exp2 or "（未获取到）")
+            return True
+        if exp2 and current_expiry and exp2 > current_expiry:
+            print(f"✅ 续期成功，刷新后到期日期: {exp2}")
+            notify("✅ 续期成功", extra="到期日期已更新", expiry_date=exp2)
+            return True
+        print(f"⚠️ 刷新后：续期按钮{'仍可用' if sel2 else '未找到'}，到期日期 {exp2 or '未获取到'}")
+    except Exception as e:
+        print(f"⚠️ 刷新核实失败: {e}")
 
     print("⚠️ 续期结果未知，到期日期未明显变化")
     _FAILED = True
